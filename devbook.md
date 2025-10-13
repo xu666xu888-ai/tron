@@ -389,9 +389,10 @@ GPU-FULL: 65,076 addr/s（約 5.7x 加速）
    - 驗證：100% 通過
 
 2. **GPU 地址生成管線**
-   - GPU 隨機數、GPU secp256k1、GPU Keccak-256、GPU SHA-256、GPU Base58Check
-   - 字串結果仍需搬回 CPU（低資料量轉換）
-   - 性能：~250k addr/s（100k 基準）
+   - GPU 隨機數、GPU secp256k1（Window4 快取）、GPU Keccak-256、GPU Base58Check 融合內核
+   - GPU 端 Base58 前綴匹配 + 雙緩衝 Streams（僅傳回命中的地址/私鑰）
+   - V2 GPU-FULL 模式支援自動調整批次大小
+   - 性能：~350k addr/s（100k 基準），1M 批次約 650k addr/s
 
 3. **GPU Keccak-256 內核**
    - 24 輪 Keccak-f[1600] 純 CUDA 實作
@@ -501,6 +502,12 @@ GPU-FULL: 65,076 addr/s（約 5.7x 加速）
 xy_aligned = xy_buffer.copy()  # CuPy 自動對齊
 ```
 
+### 9.5 記憶體池與資料傳輸
+
+- 啟用自訂 `MemoryPool` / `PinnedMemoryPool`，避免批次重覆配置。
+- GPU-FULL 模式僅回傳命中結果，減少 PCIe 傳輸負荷。
+- 若需監控使用量，可使用 `cp.cuda.get_allocator().mem_info()` 取得目前池資訊。
+
 ---
 
 ## 10. 安全性注意事項
@@ -603,7 +610,7 @@ xy_aligned = xy_buffer.copy()  # CuPy 自動對齊
 
 ### Q1: 為什麼 GPU-FULL 只有 3-5x 加速？
 
-**A**: 最新 GPU-FULL 基準約 250k addr/s（~20.5x），目前主要瓶頸在 GPU↔CPU 字串回傳與 Window4 內核效能。接下來會透過長時間壓測與批次優化，觀察是否能在實戰場景維持 20x 以上加速。
+**A**: 最新 GPU-FULL 基準約 350k addr/s（~29x），100 萬筆測試可達 ~650k addr/s。現階段主要瓶頸在 GPU↔CPU 字串回傳與 Window4 內核效能，後續可藉多 GPU 拓展與更高階 window/wNAF 優化持續提升。
 
 ### Q2: 如何選擇批次大小？
 

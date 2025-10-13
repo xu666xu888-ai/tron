@@ -16,12 +16,38 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Tuple, Optional, List
 
 from .addr import privkey_to_tron_address
 from .gpu_random import has_cupy, generate_gpu_secrets
+
+
+def _suggest_gpu_batch(prefix: str, base_batch: int, target_hits: int = 4, max_batch: int = 1 << 18) -> int:
+    """根據前綴長度估算合適的 GPU 批次大小，避免過低命中率。"""
+    if base_batch <= 0:
+        base_batch = 16384
+    prefix = prefix.strip()
+    if not prefix:
+        return base_batch
+    length = len(prefix)
+    target_hits = max(1, target_hits)
+    try:
+        denom = pow(58, length)
+    except OverflowError:
+        denom = max_batch
+    if denom <= 0:
+        denom = max_batch
+    if base_batch * target_hits >= denom:
+        suggested = base_batch
+    else:
+        needed = target_hits * denom
+        suggested = min(max_batch, max(base_batch, needed))
+    align = 256
+    suggested = int(max(align, min(max_batch, ((suggested + align - 1) // align) * align)))
+    return suggested
 
 
 def derive_and_check(privkey: bytes, prefix: str) -> Optional[Tuple[str, str]]:
@@ -50,12 +76,16 @@ def main() -> int:
 
     print(f"[V2] 目標前綴: {prefix}")
     print(f"[V2] 進程數: {max_workers}")
-    if args.gpu_batch > 0:
-        print(f"[V2] 使用 GPU 亂數，每輪 {args.gpu_batch} 筆")
-        if not has_cupy():
-            print("[V2] 警告：未偵測到 CuPy，將退化為 CPU 亂數。")
+    if args.gpu_full:
+        init_batch = args.gpu_batch or args.batch or 16384
+        print(f"[V2] 使用 GPU-FULL 模式，初始批次 {init_batch} 筆")
     else:
-        print(f"[V2] 使用 CPU 亂數，每輪 {args.batch} 筆")
+        if args.gpu_batch > 0:
+            print(f"[V2] 使用 GPU 亂數，每輪 {args.gpu_batch} 筆")
+            if not has_cupy():
+                print("[V2] 警告：未偵測到 CuPy，將退化為 CPU 亂數。")
+        else:
+            print(f"[V2] 使用 CPU 亂數，每輪 {args.batch} 筆")
 
     deadline = time.time() + args.timeout if args.timeout > 0 else None
 
@@ -63,19 +93,29 @@ def main() -> int:
         # 完整 GPU 管線模式：單行程在 GPU 上批量生成並檢查前綴
         from .gpu_addr import generate_tron_addresses_gpu
         round_idx = 0
+        base_batch = args.gpu_batch or args.batch or 16384
+        if prefix.strip() and args.gpu_batch <= 0:
+            gpu_batch = _suggest_gpu_batch(prefix, base_batch)
+            print(f"[V2] 動態調整 GPU 批次為 {gpu_batch}")
+        else:
+            gpu_batch = base_batch
         while True:
             round_idx += 1
             if deadline and time.time() > deadline:
                 print("[V2] 已達逾時，結束搜尋。")
                 return 2
 
-            addrs, privs = generate_tron_addresses_gpu(args.gpu_batch or args.batch)
-            for (hex_addr, b58), pk in zip(addrs, privs):
-                if b58.startswith(prefix):
-                    print("[V2] 命中靚號！（GPU-FULL）")
-                    print("[V2] 私鑰(HEX):", pk.hex())
-                    print("[V2] 地址(B58):", b58)
-                    return 0
+            addrs, privs = generate_tron_addresses_gpu(
+                gpu_batch,
+                prefix=prefix,
+                max_hits=1,
+            )
+            if addrs:
+                (hex_addr, b58), pk = addrs[0], privs[0]
+                print("[V2] 命中靚號！（GPU-FULL）")
+                print("[V2] 私鑰(HEX):", pk.hex())
+                print("[V2] 地址(B58):", b58)
+                return 0
 
             if round_idx % 10 == 0:
                 print(f"[V2] [GPU-FULL] 已完成 {round_idx} 輪，尚未命中…")

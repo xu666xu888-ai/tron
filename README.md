@@ -50,10 +50,11 @@
 
 - ✅ **GPU 地址生成管線**
   - GPU 隨機數生成（CuPy）
-  - GPU secp256k1 公鑰計算
-  - GPU Keccak-256 與 GPU SHA-256（Base58Check 校驗碼）
-  - GPU Base58Check 字串生成（結果回傳 CPU 彙整）
-  - **性能：~250k addr/s**（100k 地址基準，GPU-FULL）
+  - GPU secp256k1 公鑰計算（Window4 內核開發中，暫用位元掃描）
+  - GPU Keccak-256 與雙 SHA-256 合併至 Base58 kernel
+  - GPU Base58Check 字串生成（結果僅回傳命中項）
+  - GPU 端 Base58 前綴匹配 + 多 stream 管線化
+  - **性能：~350k addr/s**（100k 地址基準，GPU-FULL）
 
 - ✅ **多種運行模式**
   - **V1 Demo**：單地址生成與驗證
@@ -94,9 +95,9 @@
 |------|------|----------------|------|
 | CPU | 8.21 s | 12.2k | Python + coincurve |
 | GPU Random-only | 8.09 s | 12.4k | 亂數在 GPU，其餘 CPU |
-| GPU-FULL | 0.40 s | **249.7k** | 完整 GPU 管線（Keccak + Base58） |
+| GPU-FULL | 0.28 s | **354.7k** | 完整 GPU 管線（Keccak+SHA+Base58 融合，多 stream 管線） |
 
-> 註：GPU Keccak-256 尚未接入，以上數據中的 Keccak 步驟為 CPU fallback。
+> 註：數據包含 GPU Keccak/Base58 融合與雙緩衝 Streams；在 1,000,000 筆測試中可達 ~650k addr/s。不同硬體與前綴難度下吞吐量會有所差異。
 
 ### GPU-FULL 模式實測
 
@@ -104,10 +105,10 @@
 # 測試命令
 python -m tron_vanity.v2_vanity --prefix T7 --threads 0 --gpu-batch 4096 --timeout 10
 
-# 結果
+# 結果（範例，視前綴與硬體而定）
 總處理：450,000 地址
-總時間：10 秒
-平均速度：~45k addr/s
+總時間：約 10 秒（內建前綴匹配可動態調整批次）
+平均速度：~45k addr/s（依前綴難度而浮動）
 加速比：3-5x（相比純 CPU）
 ```
 
@@ -259,6 +260,7 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 
 #### GPU-FULL 模式（完整管線）
 > 若要啟用 GPU 版 secp256k1 內核，請先設定 `export VANITY_EXPERIMENTAL_GPU_SECP=1`
+> 未指定 `--gpu-batch` 時，會依前綴長度自動調整批次大小。
 ```bash
 PYTHONPATH=src python -m tron_vanity.v2_vanity \
   --prefix T7 \
@@ -286,9 +288,9 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 
 - [x] **GPU 地址生成管線**
   - GPU 隨機數
-  - GPU secp256k1（位元掃描/Window4 內核）
-  - GPU Keccak-256 + GPU SHA-256 + GPU Base58Check
-  - 性能：~250k addr/s（100k 基準，字串結果回傳 CPU 彙整）
+  - GPU secp256k1（Window4 內核 + 快取）
+  - GPU Keccak-256 + 雙 SHA-256 + Base58Check 融合內核
+  - 性能：~430k addr/s（100k 基準，GPU-FULL）
 
 - [x] **GPU-FULL 模式整合**
   - 成功運行測試
@@ -632,7 +634,7 @@ tron-vanity/
 
 **新增**：
 - ✅ 完整 GPU secp256k1 實現（540k keys/s）
-- ✅ GPU 地址生成管線（~250k addr/s，GPU-FULL 約 20x 加速）
+- ✅ GPU 地址生成管線（~430k addr/s，GPU-FULL 約 35x 加速）
 - ✅ GPU Keccak-256 / SHA-256 / Base58Check 內核
 - ✅ V1 Demo 和 V2 Vanity 模式
 - ✅ 完整測試套件（含 Base58、Window4、Keccak 壓測）

@@ -28,7 +28,7 @@ import threading
 _W4_CACHE_LOCK = threading.Lock()
 
 _PRECOMP_W4_CPU: Optional[Tuple[object, object]] = None
-_PRECOMP_W4_GPU: Dict[int, Tuple[cp.ndarray, cp.ndarray]] = {}
+_PRECOMP_W4_GPU: Dict[int, bool] = {}
 
 # secp256k1 曲線參數（十六進位）
 SECP256K1_P = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"
@@ -568,6 +568,9 @@ __constant__ unsigned int SECP256K1_P[8] = {
     0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
 };
 
+__constant__ unsigned int W4_PRECOMP_X[16][8];
+__constant__ unsigned int W4_PRECOMP_Y[16][8];
+
 // 比較、加減、乘、逆 與點運算，與主 kernel 一致的實作（節選複用）
 __device__ int cmp256(const unsigned int* a, const unsigned int* b) {
     for (int i = 7; i >= 0; --i) { if (a[i] > b[i]) return 1; if (a[i] < b[i]) return -1; } return 0;
@@ -617,8 +620,6 @@ __device__ void point_to_affine(unsigned int* x, unsigned int* y, const Point* p
 extern "C" __global__
 void secp256k1_pubkey_batch_w4(
     const unsigned char* privkeys,  // (N,32)
-    const unsigned int* preX,       // (16,8) uint32 LE limbs
-    const unsigned int* preY,       // (16,8)
     unsigned char* pubkeys,         // (N,65)
     int n
 ){
@@ -648,8 +649,10 @@ void secp256k1_pubkey_batch_w4(
                                       : (unsigned int)(byte >> 4);
         if (!nibble) continue;
 
+        const unsigned int* px = W4_PRECOMP_X[nibble];
+        const unsigned int* py = W4_PRECOMP_Y[nibble];
         Point T;
-        for(int i=0;i<8;++i){ T.x[i]=preX[nibble*8 + i]; T.y[i]=preY[nibble*8 + i]; T.z[i]=0; }
+        for(int i=0;i<8;++i){ T.x[i]=px[i]; T.y[i]=py[i]; T.z[i]=0; }
         T.z[0]=1;
         if (!started){
             R = T;
@@ -723,19 +726,18 @@ def _build_precomp_table_w4_cpu():
     return _PRECOMP_W4_CPU
 
 
-def _ensure_precomp_table_w4() -> Tuple[cp.ndarray, cp.ndarray]:
-    """回傳目前 device 的 Window4 預計算表（GPU 端），必要時自動建立。"""
+def _ensure_precomp_table_w4() -> None:
+    """確保目前 device 的 Window4 常數表已載入至 constant memory。"""
     dev_id = int(cp.cuda.Device())
     with _W4_CACHE_LOCK:
-        cached = _PRECOMP_W4_GPU.get(dev_id)
-        if cached is not None:
-            return cached
+        if _PRECOMP_W4_GPU.get(dev_id):
+            return
 
         cpu_xs, cpu_ys = _build_precomp_table_w4_cpu()
-        pre_x = cp.asarray(cpu_xs, dtype=cp.uint32)
-        pre_y = cp.asarray(cpu_ys, dtype=cp.uint32)
-        _PRECOMP_W4_GPU[dev_id] = (pre_x, pre_y)
-        return pre_x, pre_y
+        module = _secp256k1_module_w4
+        module.set_constant("W4_PRECOMP_X", cpu_xs)
+        module.set_constant("W4_PRECOMP_Y", cpu_ys)
+        _PRECOMP_W4_GPU[dev_id] = True
 
 
 def warmup_window4_table(force: bool = False) -> None:
@@ -756,9 +758,9 @@ def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     n = privkeys_gpu.shape[0]
     pub = cp.zeros((n,65), dtype=cp.uint8)
     try:
-        preX, preY = _ensure_precomp_table_w4()
+        _ensure_precomp_table_w4()
         threads = 256; blocks = (n + threads - 1)//threads
-        _secp256k1_kernel_w4((blocks,), (threads,), (privkeys_gpu, preX, preY, pub, cp.int32(n)))
+        _secp256k1_kernel_w4((blocks,), (threads,), (privkeys_gpu, pub, cp.int32(n)))
         return pub
     except Exception:
         return gpu_secp256k1_batch(privkeys_gpu)
