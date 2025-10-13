@@ -21,6 +21,15 @@ try:
 except ImportError as e:
     raise ImportError("需要安裝 CuPy：pip install cupy-cuda11x/12x") from e
 
+from typing import Dict, Optional, Tuple
+
+import threading
+
+_W4_CACHE_LOCK = threading.Lock()
+
+_PRECOMP_W4_CPU: Optional[Tuple[object, object]] = None
+_PRECOMP_W4_GPU: Dict[int, Tuple[cp.ndarray, cp.ndarray]] = {}
+
 # secp256k1 曲線參數（十六進位）
 SECP256K1_P = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"
 SECP256K1_N = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
@@ -617,34 +626,36 @@ void secp256k1_pubkey_batch_w4(
     if (idx >= n) return;
 
     const unsigned char* sk = privkeys + idx*32;
-    unsigned int k[8];
-    for (int i=0;i<8;++i){
-        k[i] = ((unsigned int)sk[i*4+0]) |
-               ((unsigned int)sk[i*4+1] << 8) |
-               ((unsigned int)sk[i*4+2] << 16) |
-               ((unsigned int)sk[i*4+3] << 24);
+    unsigned char scalar_be[32];
+    #pragma unroll
+    for (int b=0;b<32;++b){
+        scalar_be[b] = sk[b];
     }
 
     Point R; point_set_infinity(&R);
     bool started = false;
     for (int w = 0; w < 64; ++w){
         if (started){
-            Point tmp; point_double(&tmp,&R); R = tmp;
+            Point tmp;
+            point_double(&tmp,&R); R = tmp;
             point_double(&tmp,&R); R = tmp;
             point_double(&tmp,&R); R = tmp;
             point_double(&tmp,&R); R = tmp;
         }
 
-        int p = 252 - 4*w;
-        int wi = p >> 5;
-        int off = p & 31;
-        unsigned int nibble = k[wi] >> off;
-        if (off > 28 && wi < 7){ nibble |= k[wi+1] << (32 - off); }
-        nibble &= 0xF;
+        unsigned char byte = scalar_be[w >> 1];
+        unsigned int nibble = (w & 1) ? (unsigned int)(byte & 0x0FU)
+                                      : (unsigned int)(byte >> 4);
         if (!nibble) continue;
 
-        Point T; for(int i=0;i<8;++i){ T.x[i]=preX[nibble*8 + i]; T.y[i]=preY[nibble*8 + i]; T.z[i]=0; } T.z[0]=1;
-        if (!started){ R = T; started = true; continue; }
+        Point T;
+        for(int i=0;i<8;++i){ T.x[i]=preX[nibble*8 + i]; T.y[i]=preY[nibble*8 + i]; T.z[i]=0; }
+        T.z[0]=1;
+        if (!started){
+            R = T;
+            started = true;
+            continue;
+        }
         Point tmp; point_add(&tmp,&R,&T); R = tmp;
     }
 
@@ -688,23 +699,52 @@ def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     return pubkeys_gpu
 
 
-def _build_precomp_table_w4() -> tuple[cp.ndarray, cp.ndarray]:
-    """建立 4-bit 視窗的預計算表（0..15 倍 G），使用 coincurve 產生，再上傳到 GPU。
-    輸出形狀：(16,8) uint32（小端 limb）。
-    """
+def _build_precomp_table_w4_cpu():
+    """建立 4-bit 視窗預計算表（CPU 端），結果快取供後續 GPU 重用。"""
+    global _PRECOMP_W4_CPU
+    if _PRECOMP_W4_CPU is not None:
+        return _PRECOMP_W4_CPU
+
     import numpy as np
     import coincurve
-    xs = np.zeros((16, 8), dtype='<u4')
-    ys = np.zeros((16, 8), dtype='<u4')
+
+    xs = np.zeros((16, 8), dtype=np.uint32)
+    ys = np.zeros((16, 8), dtype=np.uint32)
     for k in range(1, 16):
-        sk = (k).to_bytes(32, 'big')
+        sk = (k).to_bytes(32, "big")
         pk = coincurve.PrivateKey(sk).public_key.format(compressed=False)
-        x = pk[1:33]; y = pk[33:65]
-        # 轉 8x32-bit 小端
+        x = pk[1:33]
+        y = pk[33:65]
         for i in range(8):
-            xs[k, i] = int.from_bytes(x[28-4*i:32-4*i], 'little')
-            ys[k, i] = int.from_bytes(y[28-4*i:32-4*i], 'little')
-    return cp.asarray(xs), cp.asarray(ys)
+            xs[k, i] = int.from_bytes(x[28 - 4 * i : 32 - 4 * i], "big")
+            ys[k, i] = int.from_bytes(y[28 - 4 * i : 32 - 4 * i], "big")
+
+    _PRECOMP_W4_CPU = (xs, ys)
+    return _PRECOMP_W4_CPU
+
+
+def _ensure_precomp_table_w4() -> Tuple[cp.ndarray, cp.ndarray]:
+    """回傳目前 device 的 Window4 預計算表（GPU 端），必要時自動建立。"""
+    dev_id = int(cp.cuda.Device())
+    with _W4_CACHE_LOCK:
+        cached = _PRECOMP_W4_GPU.get(dev_id)
+        if cached is not None:
+            return cached
+
+        cpu_xs, cpu_ys = _build_precomp_table_w4_cpu()
+        pre_x = cp.asarray(cpu_xs, dtype=cp.uint32)
+        pre_y = cp.asarray(cpu_ys, dtype=cp.uint32)
+        _PRECOMP_W4_GPU[dev_id] = (pre_x, pre_y)
+        return pre_x, pre_y
+
+
+def warmup_window4_table(force: bool = False) -> None:
+    """預先建立或重新建立目前 device 的 Window4 預計算表。"""
+    dev_id = int(cp.cuda.Device())
+    if force:
+        with _W4_CACHE_LOCK:
+            _PRECOMP_W4_GPU.pop(dev_id, None)
+    _ensure_precomp_table_w4()
 
 
 def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
@@ -716,7 +756,7 @@ def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     n = privkeys_gpu.shape[0]
     pub = cp.zeros((n,65), dtype=cp.uint8)
     try:
-        preX, preY = _build_precomp_table_w4()
+        preX, preY = _ensure_precomp_table_w4()
         threads = 256; blocks = (n + threads - 1)//threads
         _secp256k1_kernel_w4((blocks,), (threads,), (privkeys_gpu, preX, preY, pub, cp.int32(n)))
         return pub
@@ -724,4 +764,4 @@ def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
         return gpu_secp256k1_batch(privkeys_gpu)
 
 
-__all__ = ["gpu_secp256k1_batch", "gpu_secp256k1_batch_window4"]
+__all__ = ["gpu_secp256k1_batch", "gpu_secp256k1_batch_window4", "warmup_window4_table"]

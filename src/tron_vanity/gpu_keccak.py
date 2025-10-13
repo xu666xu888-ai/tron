@@ -21,7 +21,11 @@ except Exception as e:  # pragma: no cover
 
 
 _KECCAK256_KERNEL = r"""
-// 參考 Keccak-f[1600]，以 64-bit lane 實作（little-endian）
+// 參考 FIPS 202 的 Keccak-f[1600]。以 64-bit lane 形式實作，固定吸收 64 bytes。
+
+__device__ __forceinline__ unsigned long long rotl64(const unsigned long long x, const unsigned int y){
+    return (x << y) | (x >> (64 - y));
+}
 
 extern "C" __global__ void keccak256_64(
     const unsigned char* __restrict__ in64, // (N,64)
@@ -35,99 +39,97 @@ extern "C" __global__ void keccak256_64(
 
     const unsigned char* src = in64 + (size_t)i * (size_t)stride_in;
 
-    unsigned long long A[25];
+    unsigned long long st[25];
     #pragma unroll
-    for (int t=0;t<25;++t) A[t]=0ULL;
+    for (int t = 0; t < 25; ++t) st[t] = 0ULL;
 
     #pragma unroll
-    for (int j=0;j<8;++j){
+    for (int j = 0; j < 8; ++j){
         unsigned long long v =
-            ((unsigned long long)src[j*8+0])       |
-            ((unsigned long long)src[j*8+1] << 8)  |
-            ((unsigned long long)src[j*8+2] << 16) |
-            ((unsigned long long)src[j*8+3] << 24) |
-            ((unsigned long long)src[j*8+4] << 32) |
-            ((unsigned long long)src[j*8+5] << 40) |
-            ((unsigned long long)src[j*8+6] << 48) |
-            ((unsigned long long)src[j*8+7] << 56);
-        A[j] ^= v;
+            ((unsigned long long)src[j*8 + 0])       |
+            ((unsigned long long)src[j*8 + 1] << 8)  |
+            ((unsigned long long)src[j*8 + 2] << 16) |
+            ((unsigned long long)src[j*8 + 3] << 24) |
+            ((unsigned long long)src[j*8 + 4] << 32) |
+            ((unsigned long long)src[j*8 + 5] << 40) |
+            ((unsigned long long)src[j*8 + 6] << 48) |
+            ((unsigned long long)src[j*8 + 7] << 56);
+        st[j] ^= v;
     }
 
-    A[8]  ^= 0x01ULL;
-    A[16] ^= (0x80ULL << 56);
+    unsigned char* lanes = reinterpret_cast<unsigned char*>(st);
+    lanes[64]  ^= 0x01U;   // pad10*1 起始 1
+    lanes[135] ^= 0x80U;   // 最後一個 bit 1（rate=136 bytes）
 
-    const int R[25] = {
-        0, 1, 62, 28, 27,
-        36, 44, 6, 55, 20,
-        3, 10, 43, 25, 39,
-        41, 45, 15, 21, 8,
-        18, 2, 61, 56, 14
+    const unsigned int KECCAKF_ROTC[24] = {
+        1, 3, 6, 10, 15, 21, 28, 36, 45, 55,
+        2, 14, 27, 41, 56, 8, 25, 43, 62, 18,
+        39, 61, 20, 44
     };
-
-    const unsigned long long RC[24] = {
+    const unsigned int KECCAKF_PILN[24] = {
+        10, 7, 11, 17, 18, 3, 5, 16,
+        8, 21, 24, 4, 15, 23, 19, 13,
+        12, 2, 20, 14, 22, 9, 6, 1
+    };
+    const unsigned long long KECCAKF_RNDC[24] = {
         0x0000000000000001ULL, 0x0000000000008082ULL,
-        0x800000000000808aULL, 0x8000000080008000ULL,
-        0x000000000000808bULL, 0x0000000080000001ULL,
+        0x800000000000808AULL, 0x8000000080008000ULL,
+        0x000000000000808BULL, 0x0000000080000001ULL,
         0x8000000080008081ULL, 0x8000000000008009ULL,
-        0x000000000000008aULL, 0x0000000000000088ULL,
-        0x0000000080008009ULL, 0x000000008000000aULL,
-        0x000000008000808bULL, 0x800000000000008bULL,
+        0x000000000000008AULL, 0x0000000000000088ULL,
+        0x0000000080008009ULL, 0x000000008000000AULL,
+        0x000000008000808BULL, 0x800000000000008BULL,
         0x8000000000008089ULL, 0x8000000000008003ULL,
         0x8000000000008002ULL, 0x8000000000000080ULL,
-        0x000000000000800aULL, 0x800000008000000aULL,
+        0x000000000000800AULL, 0x800000008000000AULL,
         0x8000000080008081ULL, 0x8000000000008080ULL,
         0x0000000080000001ULL, 0x8000000080008008ULL
     };
 
-    auto ROTL64 = [](unsigned long long x, int s) -> unsigned long long {
-        return (x << s) | (x >> (64 - s));
-    };
-
     for (int round = 0; round < 24; ++round){
-        unsigned long long C[5], D[5];
-        for (int x=0;x<5;++x){
-            C[x] = A[x] ^ A[x+5] ^ A[x+10] ^ A[x+15] ^ A[x+20];
+        unsigned long long bc[5];
+        for (int x = 0; x < 5; ++x){
+            bc[x] = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
         }
-        for (int x=0;x<5;++x){
-            D[x] = C[(x+4)%5] ^ ROTL64(C[(x+1)%5], 1);
-        }
-        for (int y=0;y<5;++y){
-            for (int x=0;x<5;++x){
-                A[x + 5*y] ^= D[x];
+
+        for (int x = 0; x < 5; ++x){
+            unsigned long long t = bc[(x + 4) % 5] ^ rotl64(bc[(x + 1) % 5], 1);
+            for (int j = 0; j < 25; j += 5){
+                st[j + x] ^= t;
             }
         }
 
-        unsigned long long B[25];
-        for (int y=0;y<5;++y){
-            for (int x=0;x<5;++x){
-                int idx = x + 5*y;
-                int newX = y;
-                int newY = (2*x + 3*y) % 5;
-                B[newX + 5*newY] = ROTL64(A[idx], R[idx]);
+        unsigned long long t = st[1];
+        for (int x = 0; x < 24; ++x){
+            int j = KECCAKF_PILN[x];
+            unsigned long long current = st[j];
+            st[j] = rotl64(t, KECCAKF_ROTC[x]);
+            t = current;
+        }
+
+        for (int j = 0; j < 25; j += 5){
+            unsigned long long row[5];
+            for (int x = 0; x < 5; ++x) row[x] = st[j + x];
+            for (int x = 0; x < 5; ++x){
+                st[j + x] = row[x] ^ ((~row[(x + 1) % 5]) & row[(x + 2) % 5]);
             }
         }
 
-        for (int y=0;y<5;++y){
-            for (int x=0;x<5;++x){
-                A[x + 5*y] = B[x + 5*y] ^ ((~B[(x+1)%5 + 5*y]) & B[(x+2)%5 + 5*y]);
-            }
-        }
-
-        A[0] ^= RC[round];
+        st[0] ^= KECCAKF_RNDC[round];
     }
 
     unsigned char* dst = out32 + (size_t)i * (size_t)stride_out;
     #pragma unroll
-    for (int k=0;k<4;++k){
-        unsigned long long v = A[k];
-        dst[k*8+0] = (unsigned char)(v & 0xFFULL);
-        dst[k*8+1] = (unsigned char)((v >> 8) & 0xFFULL);
-        dst[k*8+2] = (unsigned char)((v >> 16) & 0xFFULL);
-        dst[k*8+3] = (unsigned char)((v >> 24) & 0xFFULL);
-        dst[k*8+4] = (unsigned char)((v >> 32) & 0xFFULL);
-        dst[k*8+5] = (unsigned char)((v >> 40) & 0xFFULL);
-        dst[k*8+6] = (unsigned char)((v >> 48) & 0xFFULL);
-        dst[k*8+7] = (unsigned char)((v >> 56) & 0xFFULL);
+    for (int k = 0; k < 4; ++k){
+        unsigned long long v = st[k];
+        dst[k*8 + 0] = (unsigned char)(v & 0xFFULL);
+        dst[k*8 + 1] = (unsigned char)((v >> 8) & 0xFFULL);
+        dst[k*8 + 2] = (unsigned char)((v >> 16) & 0xFFULL);
+        dst[k*8 + 3] = (unsigned char)((v >> 24) & 0xFFULL);
+        dst[k*8 + 4] = (unsigned char)((v >> 32) & 0xFFULL);
+        dst[k*8 + 5] = (unsigned char)((v >> 40) & 0xFFULL);
+        dst[k*8 + 6] = (unsigned char)((v >> 48) & 0xFFULL);
+        dst[k*8 + 7] = (unsigned char)((v >> 56) & 0xFFULL);
     }
 }
 """

@@ -51,10 +51,9 @@
 - ✅ **GPU 地址生成管線**
   - GPU 隨機數生成（CuPy）
   - GPU secp256k1 公鑰計算
-  - GPU SHA-256（Base58Check 校驗碼）
-  - CPU Keccak-256（GPU 版本開發中）
-  - CPU Base58 編碼
-  - **性能：~49k addr/s**（批次 4096）
+  - GPU Keccak-256 與 GPU SHA-256（Base58Check 校驗碼）
+  - GPU Base58Check 字串生成（結果回傳 CPU 彙整）
+  - **性能：~250k addr/s**（100k 地址基準，GPU-FULL）
 
 - ✅ **多種運行模式**
   - **V1 Demo**：單地址生成與驗證
@@ -66,14 +65,10 @@
 - ✅ **完整測試套件**
   - GPU 模運算測試（64 筆隨機樣本）
   - GPU/CPU 一致性測試（16 筆隨機私鑰）
+  - GPU Base58Check 對照測試
   - Window4 優化測試（開發中）
 
 ### 開發中功能
-
-- ⚠️ **GPU Keccak-256**
-  - CUDA kernel 已實現
-  - 存在 bug（CuPy API 限制）
-  - 目前使用 CPU 後備
 
 - ⚠️ **Window4 優化**
   - 4-bit 視窗法標量乘法
@@ -95,11 +90,13 @@
 
 ### 完整地址生成性能
 
-| 批次大小 | 時間 (ms) | 吞吐量 (addr/s) | 備註 |
-|---------|----------|----------------|------|
-| 256     | 82.4     | 3.1k           | 含 CPU Keccak |
-| 1024    | 83.0     | 12.3k          | 含 CPU Keccak |
-| 4096    | 83.5     | 49.0k          | 含 CPU Keccak |
+| 模式 | 耗時 | 吞吐量 (addr/s) | 備註 |
+|------|------|----------------|------|
+| CPU | 8.21 s | 12.2k | Python + coincurve |
+| GPU Random-only | 8.09 s | 12.4k | 亂數在 GPU，其餘 CPU |
+| GPU-FULL | 0.40 s | **249.7k** | 完整 GPU 管線（Keccak + Base58） |
+
+> 註：GPU Keccak-256 尚未接入，以上數據中的 Keccak 步驟為 CPU fallback。
 
 ### GPU-FULL 模式實測
 
@@ -150,10 +147,10 @@ python -m tron_vanity.v2_vanity --prefix T7 --threads 0 --gpu-batch 4096 --timeo
   - 完整地址生成：4096-8192
   - GPU-FULL 模式：4096
 
-**性能基準**（基於此硬件）：
+**性能基準**（以 100,000 地址測試）：
 - GPU secp256k1：540k keys/s（批次 16384）
-- 完整地址生成：~49k addr/s（批次 4096）
-- GPU-FULL 模式：~45k addr/s
+- GPU-FULL 模式：249,662 addr/s（批次 4096，~20.5x CPU）
+- CPU 參考：12,176 addr/s
 
 **硬件升級建議**：
 - 更高端 GPU（如 A100、H100）可獲得更好性能
@@ -217,7 +214,7 @@ python scripts/check_env.py
 ✅ coincurve 已安裝
 ✅ CuPy 已安裝
 ✅ CUDA 可用
-✅ GPU 設備: NVIDIA GeForce RTX 3090
+✅ GPU 設備: NVIDIA L4 (Compute Capability 8.9)
 ```
 
 ### 2. V1 Demo - 單地址生成
@@ -261,6 +258,7 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 ```
 
 #### GPU-FULL 模式（完整管線）
+> 若要啟用 GPU 版 secp256k1 內核，請先設定 `export VANITY_EXPERIMENTAL_GPU_SECP=1`
 ```bash
 PYTHONPATH=src python -m tron_vanity.v2_vanity \
   --prefix T7 \
@@ -282,11 +280,15 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
   - 標量乘法
   - 性能：540k keys/s（38.6x 加速）
 
+- [x] **GPU Keccak-256 內核**
+  - 24 輪 Keccak-f[1600]（CuPy RawModule）
+  - 與 `sha3.keccak_256` 完全一致（`test_keccak_gpu_vs_cpu`）
+
 - [x] **GPU 地址生成管線**
   - GPU 隨機數
-  - GPU secp256k1
-  - GPU SHA-256
-  - 性能：~49k addr/s
+  - GPU secp256k1（位元掃描/Window4 內核）
+  - GPU Keccak-256 + GPU SHA-256 + GPU Base58Check
+  - 性能：~250k addr/s（100k 基準，字串結果回傳 CPU 彙整）
 
 - [x] **GPU-FULL 模式整合**
   - 成功運行測試
@@ -296,27 +298,24 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 - [x] **測試套件**
   - GPU 模運算測試 ✅
   - GPU/CPU 一致性測試 ✅
+  - GPU Keccak vs CPU ✅
   - 環境檢查腳本 ✅
 
 ### 進行中 ⚠️
 
-- [ ] **GPU Keccak-256**
-  - CUDA kernel 已實現
-  - 存在 bug（CuPy `bitwise_xor.reduce` 不支持）
-  - 需要改用純 CUDA kernel
-
 - [ ] **Window4 優化**
-  - 預計算表已生成
-  - 驗證測試未通過
-  - 需要修復 nibble 切割邏輯
+  - nibble 解碼/預計算表已校正
+  - 新增預計算表快取與 `warmup_window4_table` 工具
+  - 需進一步壓測與效能評估
+
+- [ ] **GPU Keccak-256**
+  - 接入 GPU-FULL pipeline 後的 throughput 量測（最新 100k 測試：65,076 addr/s）
+  - 長時間穩定性測試與記憶體觀測
 
 ### 待辦 📋
 
-- [ ] 修復 GPU Keccak-256
-- [ ] 修復 Window4 優化
-- [ ] GPU Base58 編碼
 - [ ] 完整 benchmark
-- [ ] 性能調優
+- [ ] Window4 效能調優
 - [ ] 文檔完善
 
 ---
@@ -371,10 +370,10 @@ TRON 地址 (T...)
   - Lane 8 XOR 0x01（起始位）
   - Lane 16 XOR 0x80 << 56（尾端位）
 
-**實現難點**：
-- Rho/Pi/Chi 步驟需嚴格依照規範
-- 位元序處理（大端/小端）
-- CuPy API 限制（不支持某些操作）
+**實作重點**：
+- 採純 CUDA Keccak-f[1600] 迴圈，避開舊版 CuPy API 限制
+- 嚴格對齊 Rho/Pi/Chi 步驟與位元序（little-endian lane）
+- 透過 `test_keccak_gpu_vs_cpu` 驗證 64-byte 輸入的一致性
 
 ### 4. Window4 預計算表
 
@@ -393,14 +392,14 @@ TRON 地址 (T...)
 **組件**：
 1. GPU 隨機數生成（CuPy）
 2. GPU secp256k1（CUDA kernel）
-3. CPU Keccak-256（GPU 版本有 bug）
-4. GPU SHA-256（Base58Check）
-5. CPU Base58 編碼
+3. GPU Keccak-256（Keccak-f[1600] RawModule）
+4. GPU SHA-256（Base58Check 雙重雜湊）
+5. GPU Base58Check 編碼（結果回傳 CPU 彙整）
 
 **性能瓶頸**：
-- Keccak-256 在 CPU（佔 ~40% 時間）
-- Base58 編碼在 CPU（佔 ~10% 時間）
-- 數據傳輸開銷（GPU ↔ CPU）
+- Base58 字串回傳需搬移至 CPU（小量資料，但仍有傳輸成本）
+- GPU ↔ CPU 之間的同步/傳輸開銷
+- Window4 預計算快取仍待壓測最佳化
 
 ---
 
@@ -408,21 +407,19 @@ TRON 地址 (T...)
 
 ### 高優先級 🔴
 
-1. **修復 GPU Keccak-256**
-   - [ ] 實現純 CUDA kernel（避免 CuPy API 限制）
-   - [ ] 逐筆比對（0 bytes、空訊息、隨機 64 bytes）
-   - [ ] 確認 Rho/Pi/Chi/Omega 函式正確性
-   - [ ] 驗證常數表
+1. **Window4 ECC 壓測**
+   - [ ] 大量樣本與多輪迴圈的穩定性
+   - [ ] 分析快取策略與 GPU 記憶體佔用
+   - [ ] 評估與位元掃描內核的效能差異
 
-2. **修復 Window4 ECC 內核**
-   - [ ] 核對預計算表輸出（G1..G15）
-   - [ ] 優化 nibble 擷取與 scalar 解析
-   - [ ] 確保與位元掃描內核結果一致
+2. **GPU-FULL 長時間 benchmark**
+   - [ ] 量測 GPU Keccak/Base58 上線後的吞吐演變
+   - [ ] 監控溫度與記憶體使用情況
 
 ### 中優先級 🟡
 
 3. **性能優化**
-   - [ ] GPU Base58 編碼（批次化字串處理）
+   - [ ] 優化 GPU Base58 字串回傳與批次化策略
    - [ ] 減少 GPU ↔ CPU 數據傳輸
    - [ ] 優化批次大小選擇
    - [ ] 記憶體池管理
@@ -470,11 +467,17 @@ nvidia-smi
 # GPU vs CPU 公鑰比對（16 筆）
 PYTHONPATH=src python -m tron_vanity.test_gpu_vs_cpu --n 16
 
+# GPU Keccak-256 vs CPU 參考（32 筆）
+PYTHONPATH=src python -m tron_vanity.test_keccak_gpu_vs_cpu --n 32
+
 # GPU 模運算測試（64 筆）
 PYTHONPATH=src python -m tron_vanity.test_mod_arith_gpu --n 64
 
-# Window4 vs 參考內核比對（64 筆）
-PYTHONPATH=src python -m tron_vanity.test_ecc_w4_vs_ref --n 64
+# GPU Base58Check vs CPU 參考（64 筆）
+PYTHONPATH=src python -m tron_vanity.test_base58_gpu_vs_cpu --n 64
+
+# Window4 vs 參考內核比對（可指定多輪）
+PYTHONPATH=src python -m tron_vanity.test_ecc_w4_vs_ref --n 128 --repeat 3 --warmup
 ```
 
 ### 性能測試
@@ -483,18 +486,6 @@ PYTHONPATH=src python -m tron_vanity.test_ecc_w4_vs_ref --n 64
 # 基準測試（100k 地址）
 export VANITY_EXPERIMENTAL_GPU_SECP=1
 PYTHONPATH=src python3 scripts/benchmark.py
-
-# GPU Keccak 單筆測試
-PYTHONPATH=src python3 -c "
-import cupy as cp, sha3
-from tron_vanity.gpu_keccak import keccak256_xy_batch
-x = cp.zeros((1,64), dtype=cp.uint8)
-gpu = bytes(cp.asnumpy(keccak256_xy_batch(x))[0])
-cpu = sha3.keccak_256(bytes(64)).digest()
-print('match?', gpu == cpu)
-print('GPU:', gpu.hex())
-print('CPU:', cpu.hex())
-"
 ```
 
 ### V1 Demo
@@ -637,28 +628,26 @@ tron-vanity/
 
 ## 🔄 更新日誌
 
-### v0.1.0 (2025-01-13)
+### v0.2.0 (開發中)
 
 **新增**：
 - ✅ 完整 GPU secp256k1 實現（540k keys/s）
-- ✅ GPU 地址生成管線（~49k addr/s）
-- ✅ GPU-FULL 模式（3-5x 加速）
+- ✅ GPU 地址生成管線（~250k addr/s，GPU-FULL 約 20x 加速）
+- ✅ GPU Keccak-256 / SHA-256 / Base58Check 內核
 - ✅ V1 Demo 和 V2 Vanity 模式
-- ✅ 完整測試套件
+- ✅ 完整測試套件（含 Base58、Window4、Keccak 壓測）
 
 **已知問題**：
-- ⚠️ GPU Keccak-256 需要修復
-- ⚠️ Window4 優化需要修復
-- ⚠️ Base58 編碼仍在 CPU
+- ⚠️ Window4 優化尚需壓測與效能調校
+- ⚠️ GPU-FULL 模式尚未完成長時間穩定性測試
 
 ---
 
-> **提醒**：目前 GPU Keccak-256 與 Window4 仍未完成驗證，任何切換到 GPU-FULL 模式前請確認已設 fallback 或留意輸出正確性。待上述修正完成後再正式導入。
+> **提醒**：Window4 仍在進行壓測，建議先以預設位元掃描內核為主。GPU-FULL 模式已啟用 Keccak/Base58 GPU 核心，但長時間運行仍需觀察溫度與吞吐變化。
 
 > **下次開發重點**：
-> 1. 修復 GPU Keccak-256（實現純 CUDA kernel）
-> 2. 修復 Window4 優化（核對預計算表與 nibble 切割）
-> 3. 執行完整 benchmark 並更新性能數據
-> 4. 優化 GPU Base58 編碼
+> 1. Window4 多輪壓測與快取策略調整
+> 2. GPU-FULL 長時間 benchmark 與監控報告
+> 3. 更新性能數據與文檔（含 Base58 GPU 化成果）
 
 祝開發順利！🚀

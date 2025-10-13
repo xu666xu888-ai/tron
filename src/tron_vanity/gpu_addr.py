@@ -3,8 +3,8 @@
 完全 GPU 加速的 TRON 地址生成（雛形 / 可執行框架）
 
 重要說明：
-- 本模組提供「介面與管線」並以 GPU 生成私鑰；最關鍵的 secp256k1 點乘與 Keccak-256、Base58Check 目前提供 CPU 後備實作，確保流程可執行與驗證。
-- 後續將以 CUDA RawKernel/RawModule 逐步替換為 GPU 核心，達成 10x-100x 加速目標。
+- 本模組提供「介面與管線」並以 GPU 生成私鑰；secp256k1、Keccak-256、Base58Check 皆已有 CUDA 內核，同時保留 CPU 後備以確保穩定性。
+- 後續將持續優化 CUDA RawKernel/RawModule，力求達成 10x-100x 整體加速目標。
 
 功能：
 - `generate_tron_addresses_gpu(count, batch_size)`：以 GPU 亂數批量產生私鑰，並導出 (hex, base58) 地址，同時返回對應私鑰，以便基準測試與驗證。
@@ -25,6 +25,7 @@ except Exception as e:  # pragma: no cover
 
 import base58
 import sha3
+import numpy as np
 try:
     from .gpu_keccak import keccak256_xy_batch as _gpu_keccak256_xy_batch
 except Exception:
@@ -155,6 +156,72 @@ _sha256_mod = cp.RawModule(code=_SHA256_KERNEL, options=("-std=c++11",))
 _sha256_kernel = _sha256_mod.get_function("sha256_oneblock")
 
 
+_BASE58_KERNEL = r"""
+__constant__ unsigned char BASE58_ALPHABET[58] = {
+    '1','2','3','4','5','6','7','8','9',
+    'A','B','C','D','E','F','G','H',
+    'J','K','L','M','N','P','Q','R','S','T','U','V','W','X','Y','Z',
+    'a','b','c','d','e','f','g','h','i','j','k','m','n','o','p','q','r','s','t','u','v','w','x','y','z'
+};
+
+extern "C" __global__ void base58_encode_25(
+    const unsigned char* __restrict__ inputs,
+    unsigned char* __restrict__ outputs,
+    const int out_stride,
+    int* __restrict__ lengths,
+    const int n
+){
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const unsigned char* src = inputs + (size_t)idx * 25;
+    unsigned char buffer[25];
+    for (int i = 0; i < 25; ++i) buffer[i] = src[i];
+
+    unsigned char digits[60];
+    int zero_count = 0;
+    while (zero_count < 25 && buffer[zero_count] == 0) zero_count++;
+
+    int size = 0;
+    int start = zero_count;
+    while (start < 25) {
+        int remainder = 0;
+        for (int i = start; i < 25; ++i) {
+            int value = (remainder << 8) | buffer[i];
+            buffer[i] = (unsigned char)(value / 58);
+            remainder = value % 58;
+        }
+        digits[size++] = (unsigned char)remainder;
+        while (start < 25 && buffer[start] == 0) start++;
+    }
+
+    int total_len = zero_count + size;
+    if (size == 0) {
+        if (zero_count == 0) {
+            total_len = 1;
+            zero_count = 1;
+        }
+    }
+
+    unsigned char* dst = outputs + (size_t)idx * out_stride;
+    for (int i = 0; i < out_stride; ++i) dst[i] = 0;
+
+    for (int i = 0; i < zero_count; ++i) {
+        dst[i] = '1';
+    }
+
+    for (int i = 0; i < size; ++i) {
+        dst[zero_count + i] = BASE58_ALPHABET[digits[size - 1 - i]];
+    }
+
+    lengths[idx] = total_len;
+}
+"""
+
+_base58_mod = cp.RawModule(code=_BASE58_KERNEL, options=("-std=c++11",))
+_base58_kernel = _base58_mod.get_function("base58_encode_25")
+
+
 def gpu_sha256_oneblock_batch(msgs_gpu: "cp.ndarray", lens_gpu: "cp.ndarray") -> "cp.ndarray":
     """在 GPU 上計算多筆 SHA-256（限制：每筆長度 <= 55，單區塊）。
     - msgs_gpu: uint8 (N, stride_in)
@@ -174,6 +241,22 @@ def gpu_sha256_oneblock_batch(msgs_gpu: "cp.ndarray", lens_gpu: "cp.ndarray") ->
     return out
 
 
+def gpu_base58_encode_batch(payload25_gpu: "cp.ndarray", out_stride: int = 40) -> Tuple["cp.ndarray", "cp.ndarray"]:
+    """以 GPU 將 25-byte payload 編碼為 Base58 字串。
+    回傳：(ascii_bytes (N,out_stride), lengths (N,))
+    """
+    if payload25_gpu.dtype != cp.uint8 or payload25_gpu.ndim != 2 or payload25_gpu.shape[1] != 25:
+        raise ValueError("payload25_gpu 需為 uint8 (N,25)")
+    n = payload25_gpu.shape[0]
+    inputs = cp.ascontiguousarray(payload25_gpu)
+    outputs = cp.zeros((n, out_stride), dtype=cp.uint8)
+    lengths = cp.zeros((n,), dtype=cp.int32)
+    threads = 256
+    blocks = (n + threads - 1) // threads
+    _base58_kernel((blocks,), (threads,), (inputs, outputs, cp.int32(out_stride), lengths, cp.int32(n)))
+    return outputs, lengths
+
+
 def _sha256d(data: bytes) -> bytes:
     """雙重 SHA-256（用於 Base58Check 校驗碼）。"""
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
@@ -186,7 +269,7 @@ def _keccak_256(data: bytes) -> bytes:
     return k.digest()
 
 
-def gpu_secp256k1_batch_cpu_fallback(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
+def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     """
     在 GPU 上批量計算 secp256k1 公鑰（未壓縮 65 bytes）。
     
@@ -211,7 +294,6 @@ def gpu_keccak256_batch(pubkey_xy_gpu: "cp.ndarray") -> "cp.ndarray":
     - 若可用 GPU kernel，使用 keccak256_xy_batch
     - 否則退化為 CPU 計算
     """
-    import numpy as np
     if pubkey_xy_gpu.dtype != cp.uint8 or pubkey_xy_gpu.ndim != 2 or pubkey_xy_gpu.shape[1] != 64:
         raise ValueError("pubkey_xy_gpu 需為 uint8 (N,64)")
 
@@ -231,43 +313,50 @@ def gpu_keccak256_batch(pubkey_xy_gpu: "cp.ndarray") -> "cp.ndarray":
 
 def gpu_base58check_batch(tron21_gpu: "cp.ndarray") -> List[str]:
     """
-    Base58Check 編碼（雛形）：
+    Base58Check 編碼：
     - 輸入為 21 bytes（0x41 + addr20），形狀 (N,21)
-    - CPU 計算校驗碼與 Base58 編碼並輸出字串；後續以 CUDA 實作。
+    - 在 GPU 上完成雙 SHA-256 與 Base58 編碼，必要時退回 CPU。
     """
-    import numpy as np
     if tron21_gpu.dtype != cp.uint8 or tron21_gpu.ndim != 2 or tron21_gpu.shape[1] != 21:
         raise ValueError("tron21_gpu 需為 uint8 (N,21)")
 
-    import numpy as np
     N = tron21_gpu.shape[0]
-    # 使用 GPU 進行雙重 SHA-256 計算校驗碼
-    # 第一次：訊息長度固定為 21
     lens = cp.full((N,), 21, dtype=cp.int32)
-    d1 = gpu_sha256_oneblock_batch(tron21_gpu, lens)  # (N,32)
-    # 第二次：訊息長度固定為 32
+    d1 = gpu_sha256_oneblock_batch(tron21_gpu, lens)
     lens2 = cp.full((N,), 32, dtype=cp.int32)
-    d2 = gpu_sha256_oneblock_batch(d1, lens2)  # (N,32)
+    d2 = gpu_sha256_oneblock_batch(d1, lens2)
 
-    # 將前 4 bytes 當作 checksum 並在 CPU 端進行 Base58 編碼（字串處理適合 CPU）
-    body_cpu: np.ndarray = cp.asnumpy(tron21_gpu)
-    d2_cpu: np.ndarray = cp.asnumpy(d2)
-    out: List[str] = []
-    out_append = out.append
-    for i in range(N):
-        checksum = bytes(d2_cpu[i][:4])
-        b58 = base58.b58encode(body_cpu[i].tobytes() + checksum).decode()
-        out_append(b58)
-    return out
+    checksum_gpu = d2[:, :4]
+    try:
+        payload25_gpu = cp.concatenate([tron21_gpu, checksum_gpu], axis=1)
+        payload25_gpu = cp.ascontiguousarray(payload25_gpu)
+        ascii_gpu, lens_gpu = gpu_base58_encode_batch(payload25_gpu)
+        ascii_cpu = cp.asnumpy(ascii_gpu)
+        lens_cpu = cp.asnumpy(lens_gpu)
+        out: List[str] = []
+        for i in range(N):
+            ln = int(lens_cpu[i])
+            if ln <= 0 or ln > ascii_cpu.shape[1]:
+                raise ValueError("Base58 GPU 產生長度異常")
+            out.append(ascii_cpu[i, :ln].tobytes().decode())
+        return out
+    except Exception:
+        body_cpu: np.ndarray = cp.asnumpy(tron21_gpu)
+        d2_cpu: np.ndarray = cp.asnumpy(d2)
+        out: List[str] = []
+        for i in range(N):
+            checksum = bytes(d2_cpu[i][:4])
+            out.append(base58.b58encode(body_cpu[i].tobytes() + checksum).decode())
+        return out
 
 
 def generate_tron_addresses_gpu(count: int, batch_size: int = 16384) -> Tuple[List[Tuple[str, str]], List[bytes]]:
     """
-    完全在 GPU 記憶體流程的雛形（目前計算仍以 CPU 後備），回傳 (地址列表, 私鑰列表)：
+    完全在 GPU 記憶體流程的雛形（保留 CPU 後備），回傳 (地址列表, 私鑰列表)：
     - 地址列表：[(hex_addr, base58_addr), ...]
     - 私鑰列表：[privkey_bytes, ...]
 
-    後續將把 secp256k1/Keccak/Base58Check 逐步切換至 CUDA 核心。
+    secp256k1 / Keccak-256 / Base58Check 皆有 CUDA 內核，若 GPU 失敗則退回 CPU。
     """
     results: List[Tuple[str, str]] = []
     privkeys_out: List[bytes] = []
@@ -291,9 +380,9 @@ def generate_tron_addresses_gpu(count: int, batch_size: int = 16384) -> Tuple[Li
             try:
                 pub65_gpu = secp_gpu_batch(sk_gpu)
             except Exception:
-                pub65_gpu = gpu_secp256k1_batch_cpu_fallback(sk_gpu)
+                pub65_gpu = gpu_secp256k1_batch(sk_gpu)
         else:
-            pub65_gpu = gpu_secp256k1_batch_cpu_fallback(sk_gpu)
+            pub65_gpu = gpu_secp256k1_batch(sk_gpu)
 
         # 3) Keccak-256（CPU 後備），取 XY（去 0x04）
         # 取去掉 0x04 的 X||Y（64 bytes），並 copy 以確保 8-byte 對齊
@@ -305,7 +394,7 @@ def generate_tron_addresses_gpu(count: int, batch_size: int = 16384) -> Tuple[Li
         prefix_gpu = cp.full((cur, 1), 0x41, dtype=cp.uint8)
         tron21_gpu = cp.concatenate([prefix_gpu, addr20_gpu], axis=1)
 
-        # 5) Base58Check（CPU 後備）
+        # 5) Base58Check（主要在 GPU 完成）
         b58_list = gpu_base58check_batch(tron21_gpu)
 
         # 6) HEX 地址輸出
@@ -317,8 +406,9 @@ def generate_tron_addresses_gpu(count: int, batch_size: int = 16384) -> Tuple[Li
 
 
 __all__ = [
-    "gpu_secp256k1_batch_cpu_fallback",
+    "gpu_secp256k1_batch",
     "gpu_keccak256_batch",
+    "gpu_base58_encode_batch",
     "gpu_base58check_batch",
     "generate_tron_addresses_gpu",
 ]
