@@ -42,6 +42,15 @@
 
 ---
 
+## 0. 最新更新（2025-10-13）
+
+- **Base58 前綴 / 尾碼雙向匹配**：`gpu_addr.generate_tron_addresses_gpu` 支援 GPU 端尾碼篩選（例如 `...88888`、`...david`），並保留 CPU 回退驗證。
+- **HardwareAdaptiveConfig 上線**：啟動時自動偵測 GPU（L4 / RTX4090 / A100 / H100 等）調整批次大小、窗口門檻、CUDA threads、Stream 數與記憶體池上限，可用環境變數覆蓋。
+- **CLI 產品化計畫啟動**：新增 `CODEX_TASK_PRODUCT_CLI.md`，規劃系統檢測、自動依賴、性能預估與 `rich` CLI 監控，目標交付產品級使用體驗。
+- **依賴指引更新**：無法自動安裝的系統級工具（CUDA Toolkit、NVIDIA Driver、Node.js）將提供官方安裝指引且不在程式內自動執行。
+
+---
+
 ## 1. 檔案結構樹
 
 ```
@@ -63,8 +72,8 @@
       ├─ validate.py               # 地址驗證
       ├─ gpu_random.py             # GPU 隨機數生成
       ├─ gpu_secp256k1.py          # ✅ GPU secp256k1 (583 行 CUDA kernel)
-      ├─ gpu_secp256k1_v2.py       # ⚠️ Window4 優化版本（開發中）
-      ├─ gpu_keccak.py             # ⚠️ GPU Keccak-256（有 bug）
+      ├─ hardware_config.py        # ✅ 硬體自適應配置（批次/Streams/threads）
+      ├─ gpu_keccak.py             # ✅ GPU Keccak-256
       ├─ gpu_addr.py               # GPU 地址生成管線
       ├─ v1_demo.py                # V1：單筆驗證
       ├─ v2_vanity.py              # V2：靚號搜尋（支持 GPU-FULL）
@@ -123,6 +132,10 @@ pip install cupy-cuda12x
 # 5. 驗證環境
 python scripts/check_env.py
 ```
+
+> **依賴提示**：`python -m tron_vanity.cli` 會檢測並自動安裝缺失的 Python 套件（如 `cupy`, `rich`, `psutil`, `GPUtil`）。CUDA Toolkit、NVIDIA Driver、Node.js 等系統級工具仍需使用者依照官方文檔手動安裝，CLI 將提供建議命令與連結。
+
+> **環境變數覆蓋**：可透過 `VANITY_WNAF_MAX_BATCH`、`VANITY_STREAM_COUNT_DEFAULT`、`VANITY_MAX_PENDING_MULTIPLIER` 與各類 `VANITY_*_THREADS` 變數微調硬體自適應參數。
 
 ### 環境變數（可選）
 

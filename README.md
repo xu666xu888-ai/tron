@@ -56,6 +56,15 @@
   - GPU 端 Base58 前綴匹配 + 多 stream 管線化
   - **性能：~350k addr/s**（100k 地址基準，GPU-FULL）
 
+- ✅ **Base58 前綴 / 尾碼雙向匹配**
+  - GPU 於 Base58 結果上同時支援前綴 (`T...`) 與尾碼（例如 `...88888`）比對
+  - 支援 CPU 回退邏輯確保一致性
+
+- ✅ **硬體自適應配置（HardwareAdaptiveConfig）**
+  - 自動偵測 GPU 型號、SM 數、VRAM、Compute Capability
+  - 依硬體設定批次大小、Window4 門檻、CUDA threads、Stream 數
+  - 以環境變數覆蓋，方便手動調整
+
 - ✅ **多種運行模式**
   - **V1 Demo**：單地址生成與驗證
   - **V2 Vanity**：靚號地址搜索
@@ -178,9 +187,21 @@ source .venv/bin/activate
 # 3. 安裝依賴
 pip install -r requirements.txt
 
-# 4. 驗證環境
+# 4. 若啟用 GPU，請先確認系統已安裝對應 CUDA Toolkit / 驅動
+#    （若缺少，請依下方「依賴指引」手動安裝）
+
+# 5. 驗證環境
 python scripts/check_env.py
 ```
+
+### 依賴自動安裝與指引
+
+- `python -m tron_vanity.cli` 將檢測 Python 依賴並嘗試透過 `pip` 安裝缺失模組（如 `cupy`, `rich`, `psutil`, `GPUtil`）。
+- 針對 CuPy 會依據 CUDA 版本提示安裝 `cupy-cuda11x` / `cupy-cuda12x`；若無 GPU，可改裝 `cupy`（CPU 版本）。
+- **CUDA Toolkit、NVIDIA Driver、Node.js 等系統級工具需使用者自行安裝**，CLI 會提供官方指引與命令範例，避免在未知環境中自動變更系統。
+- 可使用以下環境變數覆蓋硬體自適應設定：
+  - `VANITY_WNAF_MAX_BATCH`、`VANITY_STREAM_COUNT_DEFAULT`、`VANITY_MAX_PENDING_MULTIPLIER`
+  - `VANITY_SECP_THREADS`、`VANITY_KECCAK_THREADS`、`VANITY_SHA_THREADS`、`VANITY_BASE58_THREADS`
 
 ### requirements.txt
 
@@ -550,8 +571,8 @@ tron-vanity/
 │   │
 │   ├── gpu_random.py           # GPU 隨機數
 │   ├── gpu_secp256k1.py        # GPU secp256k1 (583 行)
-│   ├── gpu_secp256k1_v2.py     # GPU secp256k1 Window4
-│   ├── gpu_keccak.py           # GPU Keccak-256 (開發中)
+│   ├── hardware_config.py      # GPU/CPU 硬體自適應配置
+│   ├── gpu_keccak.py           # GPU Keccak-256
 │   ├── gpu_addr.py             # GPU 地址生成管線
 │   │
 │   ├── v1_demo.py              # V1 演示模式
@@ -566,6 +587,28 @@ tron-vanity/
 ├── claude.md                    # Claude 對話記錄
 └── devbook.md                   # 開發手冊
 ```
+
+---
+
+## 🧭 CLI 產品化計畫
+
+為了讓 TRON 靚號生成器以「產品級 CLI」形式交付，我們規劃以下三階段工作，詳見 `CODEX_TASK_PRODUCT_CLI.md`：
+
+1. **環境檢測與自動配置**
+   - `system_info.py`：收集 OS / CPU / GPU / 記憶體 / Python 版本資訊
+   - `dependency_checker.py`：檢查 Python 套件與系統工具（CUDA Toolkit、`nvidia-smi`、Node.js 等）
+   - `auto_installer.py`：針對缺失的 Python 依賴執行 `pip install`，若遇系統級工具，提供官方安裝指引與命令範例
+
+2. **動態配置與性能預估**
+   - 強化 `hardware_config.py`，依硬體自動調整批次、Stream 數、Window4 門檻、CUDA threads 與記憶體池上限
+   - `performance_estimator.py`：根據靚號末碼長度預估搜尋時間（例如 5 位 ≈ 15 分鐘 @ 700k addr/s）
+
+3. **產品級 CLI UI**
+   - `cli.py` 為主入口，整合 ASCII Logo、硬體摘要、靚號輸入與難度評估
+   - `monitor.py` + `ui_components.py` 使用 `rich` 呈現速率、已檢查數量、GPU/CPU 負載、溫度、性能火花線等資訊
+   - 支援前綴與尾碼搜尋、優雅 Ctrl+C、結果匯出與續跑
+
+> **注意**：CUDA Toolkit / NVIDIA Driver / Node.js 等系統級元件仍需使用者依平台指南手動安裝，CLI 會於檢測階段提供推薦命令與官方連結。
 
 ---
 

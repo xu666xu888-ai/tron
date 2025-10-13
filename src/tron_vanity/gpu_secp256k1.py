@@ -16,14 +16,19 @@ GPU secp256k1 橢圓曲線點乘 CUDA kernel
 """
 from __future__ import annotations
 
+import os
+import logging
+import threading
+from typing import Dict, Optional, Tuple
+
 try:
     import cupy as cp
 except ImportError as e:
     raise ImportError("需要安裝 CuPy：pip install cupy-cuda11x/12x") from e
 
-from typing import Dict, Optional, Tuple
+from .hardware_config import HARDWARE_CONFIG
 
-import threading
+_SECP_THREADS = int(os.environ.get("VANITY_SECP_THREADS", str(HARDWARE_CONFIG.secp_threads)))
 
 _W4_CACHE_LOCK = threading.Lock()
 
@@ -617,6 +622,72 @@ __device__ void point_to_affine(unsigned int* x, unsigned int* y, const Point* p
     mul256_mod(y, p->y, z_inv3);
 }
 
+// ---- wNAF helper ----
+__device__ __forceinline__ bool u256_is_zero(const unsigned long long* limbs){
+    return (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0ULL;
+}
+
+__device__ __forceinline__ void u256_shr1(unsigned long long* limbs){
+    unsigned long long carry = 0ULL;
+    for(int i=3;i>=0;--i){
+        unsigned long long next = limbs[i] & 1ULL;
+        limbs[i] = (limbs[i] >> 1) | (carry << 63);
+        carry = next;
+    }
+}
+
+__device__ __forceinline__ void u256_sub_small(unsigned long long* limbs, unsigned int value){
+    unsigned long long borrow = value;
+    for(int i=0;i<4 && borrow;i++){
+        unsigned long long cur = limbs[i];
+        unsigned long long sub = borrow;
+        unsigned long long res = cur - sub;
+        limbs[i] = res;
+        borrow = (cur < sub) ? 1ULL : 0ULL;
+    }
+}
+
+__device__ __forceinline__ void u256_add_small(unsigned long long* limbs, unsigned int value){
+    unsigned long long carry = value;
+    for(int i=0;i<4 && carry;i++){
+        unsigned long long cur = limbs[i];
+        unsigned long long res = cur + carry;
+        limbs[i] = res;
+        carry = (res < cur) ? 1ULL : 0ULL;
+    }
+}
+
+__device__ int wnaf_4(signed char* digits, const unsigned char* scalar_be){
+    unsigned long long limbs[4];
+    #pragma unroll
+    for(int i=0;i<4;++i){
+        int base = 24 - i*8;
+        unsigned long long v = 0ULL;
+        #pragma unroll
+        for(int j=0;j<8;++j){
+            v = (v << 8) | (unsigned long long)scalar_be[base + j];
+        }
+        limbs[i] = v;
+    }
+    int pos = 0;
+    while(!u256_is_zero(limbs)){
+        int digit = 0;
+        if(limbs[0] & 1ULL){
+            unsigned int mod = (unsigned int)(limbs[0] & 0xFULL);
+            if(mod > 8U) mod -= 16U;
+            digit = (int)mod;
+            if(digit > 0){
+                u256_sub_small(limbs, (unsigned int)digit);
+            } else {
+                u256_add_small(limbs, (unsigned int)(-digit));
+            }
+        }
+        digits[pos++] = (signed char)digit;
+        u256_shr1(limbs);
+    }
+    return pos;
+}
+
 extern "C" __global__
 void secp256k1_pubkey_batch_w4(
     const unsigned char* privkeys,  // (N,32)
@@ -633,33 +704,48 @@ void secp256k1_pubkey_batch_w4(
         scalar_be[b] = sk[b];
     }
 
-    Point R; point_set_infinity(&R);
-    bool started = false;
-    for (int w = 0; w < 64; ++w){
-        if (started){
-            Point tmp;
-            point_double(&tmp,&R); R = tmp;
-            point_double(&tmp,&R); R = tmp;
-            point_double(&tmp,&R); R = tmp;
-            point_double(&tmp,&R); R = tmp;
-        }
+    signed char digits[260];
+    int wlen = wnaf_4(digits, scalar_be);
 
-        unsigned char byte = scalar_be[w >> 1];
-        unsigned int nibble = (w & 1) ? (unsigned int)(byte & 0x0FU)
-                                      : (unsigned int)(byte >> 4);
-        if (!nibble) continue;
+    if (wlen == 0){
+        unsigned char* out_zero = pubkeys + idx*65;
+        for(int i=0;i<65;++i) out_zero[i] = 0;
+        return;
+    }
 
-        const unsigned int* px = W4_PRECOMP_X[nibble];
-        const unsigned int* py = W4_PRECOMP_Y[nibble];
+    Point R;
+    point_set_infinity(&R);
+    for (int i = wlen - 1; i >= 0; --i){
+        Point tmp;
+        point_double(&tmp, &R);
+        R = tmp;
+
+        int digit = (int)digits[i];
+        if (!digit) continue;
+
+        int idx_tbl = digit > 0 ? digit : -digit;
+        const unsigned int* px = W4_PRECOMP_X[idx_tbl];
+        const unsigned int* py = W4_PRECOMP_Y[idx_tbl];
+
         Point T;
-        for(int i=0;i<8;++i){ T.x[i]=px[i]; T.y[i]=py[i]; T.z[i]=0; }
-        T.z[0]=1;
-        if (!started){
-            R = T;
-            started = true;
-            continue;
+        for(int limb=0; limb<8; ++limb){
+            T.x[limb] = px[limb];
+            T.y[limb] = py[limb];
+            T.z[limb] = 0U;
         }
-        Point tmp; point_add(&tmp,&R,&T); R = tmp;
+        T.z[0] = 1U;
+
+        if (digit < 0){
+            unsigned int negy[8];
+            sub256_mod(negy, SECP256K1_P, T.y);
+            for(int limb=0; limb<8; ++limb){
+                T.y[limb] = negy[limb];
+            }
+        }
+
+        Point summed;
+        point_add(&summed, &R, &T);
+        R = summed;
     }
 
     // 輸出未壓縮公鑰（0x04 + X + Y，大端序）
@@ -673,6 +759,8 @@ void secp256k1_pubkey_batch_w4(
 
 _secp256k1_module_w4 = cp.RawModule(code=_SECP256K1_KERNEL_W4, options=("-std=c++11",))
 _secp256k1_kernel_w4 = _secp256k1_module_w4.get_function("secp256k1_pubkey_batch_w4")
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
@@ -691,7 +779,7 @@ def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     n = privkeys_gpu.shape[0]
     pubkeys_gpu = cp.zeros((n, 65), dtype=cp.uint8)
     
-    threads = 256
+    threads = _SECP_THREADS
     blocks = (n + threads - 1) // threads
     
     _secp256k1_kernel(
@@ -731,13 +819,25 @@ def _ensure_precomp_table_w4() -> None:
     dev_id = int(cp.cuda.Device())
     with _W4_CACHE_LOCK:
         if _PRECOMP_W4_GPU.get(dev_id):
+            _LOGGER.debug("[WNAF] Device %d 已存在 Window4 常數表，略過初始化", dev_id)
             return
 
-        cpu_xs, cpu_ys = _build_precomp_table_w4_cpu()
-        module = _secp256k1_module_w4
-        module.set_constant("W4_PRECOMP_X", cpu_xs)
-        module.set_constant("W4_PRECOMP_Y", cpu_ys)
-        _PRECOMP_W4_GPU[dev_id] = True
+        _LOGGER.info("[WNAF] 開始於裝置 %d 載入 Window4 常數表", dev_id)
+        try:
+            cpu_xs, cpu_ys = _build_precomp_table_w4_cpu()
+            module = _secp256k1_module_w4
+            ptr_x = module.get_global("W4_PRECOMP_X")
+            ptr_y = module.get_global("W4_PRECOMP_Y")
+            dest_x = cp.ndarray(cpu_xs.shape, dtype=cp.uint32, memptr=ptr_x)
+            dest_y = cp.ndarray(cpu_ys.shape, dtype=cp.uint32, memptr=ptr_y)
+            dest_x[...] = cp.asarray(cpu_xs)
+            dest_y[...] = cp.asarray(cpu_ys)
+            _PRECOMP_W4_GPU[dev_id] = True
+            _LOGGER.info("[WNAF] 裝置 %d Window4 常數表載入完成", dev_id)
+        except Exception as exc:  # pragma: no cover
+            _PRECOMP_W4_GPU.pop(dev_id, None)
+            _LOGGER.exception("[WNAF] 裝置 %d 載入常數表失敗：%s", dev_id, exc)
+            raise
 
 
 def warmup_window4_table(force: bool = False) -> None:
@@ -746,6 +846,7 @@ def warmup_window4_table(force: bool = False) -> None:
     if force:
         with _W4_CACHE_LOCK:
             _PRECOMP_W4_GPU.pop(dev_id, None)
+        _LOGGER.info("[WNAF] 強制重建裝置 %d 的 Window4 常數表", dev_id)
     _ensure_precomp_table_w4()
 
 
@@ -759,10 +860,12 @@ def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     pub = cp.zeros((n,65), dtype=cp.uint8)
     try:
         _ensure_precomp_table_w4()
-        threads = 256; blocks = (n + threads - 1)//threads
+        threads = _SECP_THREADS
+        blocks = (n + threads - 1)//threads
         _secp256k1_kernel_w4((blocks,), (threads,), (privkeys_gpu, pub, cp.int32(n)))
         return pub
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning("[WNAF] Window4 kernel 執行失敗，改用傳統內核：%s", exc)
         return gpu_secp256k1_batch(privkeys_gpu)
 
 

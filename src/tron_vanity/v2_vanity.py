@@ -23,6 +23,7 @@ from typing import Tuple, Optional, List
 
 from .addr import privkey_to_tron_address
 from .gpu_random import has_cupy, generate_gpu_secrets
+from .hardware_config import get_hardware_config
 
 
 def _suggest_gpu_batch(prefix: str, base_batch: int, target_hits: int = 4, max_batch: int = 1 << 18) -> int:
@@ -92,6 +93,7 @@ def main() -> int:
     if args.gpu_full:
         # 完整 GPU 管線模式：單行程在 GPU 上批量生成並檢查前綴
         from .gpu_addr import generate_tron_addresses_gpu
+        hw_cfg = get_hardware_config()
         round_idx = 0
         base_batch = args.gpu_batch or args.batch or 16384
         if prefix.strip() and args.gpu_batch <= 0:
@@ -99,6 +101,8 @@ def main() -> int:
             print(f"[V2] 動態調整 GPU 批次為 {gpu_batch}")
         else:
             gpu_batch = base_batch
+        dynamic_plan = hw_cfg.default_batches[:4] if hw_cfg.default_batches else (16384, 32768, 65536)
+        stream_hint = max(hw_cfg.default_streams, 8 if len(prefix) >= 4 else 6)
         while True:
             round_idx += 1
             if deadline and time.time() > deadline:
@@ -109,6 +113,8 @@ def main() -> int:
                 gpu_batch,
                 prefix=prefix,
                 max_hits=1,
+                dynamic_batches=dynamic_plan,
+                stream_count=stream_hint,
             )
             if addrs:
                 (hex_addr, b58), pk = addrs[0], privs[0]
