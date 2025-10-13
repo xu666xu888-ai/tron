@@ -1,0 +1,11 @@
+coincurve>=18.0.0
+base58>=2.1.1
+tronpy>=0.4.0
+requests>=2.31.0
+# pysha3 最新穩定版為 1.0.2，提供 sha3 模組
+pysha3>=1.0.2
+# numpy 與 Python 版本相容性：Py3.8 建議 1.24.x 最末版
+numpy>=1.24,<1.25
+# CUDA: 請依據 GPU/CUDA 版本選擇安裝其中之一（在 devbook.md 有指引）
+# cupy-cuda12x
+# cupy-cuda11x
