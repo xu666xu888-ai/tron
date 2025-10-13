@@ -1,0 +1,664 @@
+# TRON Vanity Address Generator with GPU Acceleration
+
+高性能 TRON 靚號地址生成器，支持 CPU 和 GPU 加速模式。
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![CUDA](https://img.shields.io/badge/CUDA-11.0+-green.svg)](https://developer.nvidia.com/cuda-downloads)
+
+---
+
+## 📋 目錄
+
+- [項目概述](#項目概述)
+- [核心特性](#核心特性)
+- [性能指標](#性能指標)
+- [安裝說明](#安裝說明)
+- [快速開始](#快速開始)
+- [開發進度](#開發進度)
+- [技術要點](#技術要點)
+- [待辦清單](#待辦清單)
+- [常用指令](#常用指令)
+- [項目結構](#項目結構)
+- [貢獻指南](#貢獻指南)
+
+---
+
+## 🎯 項目概述
+
+本項目實現了高性能的 TRON 地址生成器，特別針對靚號地址搜索進行了優化。通過 GPU 加速關鍵的密碼學運算（secp256k1 橢圓曲線、SHA-256、Keccak-256），實現了相比純 CPU 實現的顯著性能提升。
+
+### 什麼是靚號地址？
+
+靚號地址是指包含特定前綴或模式的區塊鏈地址，例如：
+- `T7777...` - 包含連續數字
+- `TABCD...` - 包含特定字母組合
+- `T1234567...` - 包含順序數字
+
+---
+
+## ✨ 核心特性
+
+### 已實現功能
+
+- ✅ **完整 GPU secp256k1 實現**
+  - 583 行 CUDA kernel
+  - 256-bit 大數模運算（針對 secp256k1 素數優化）
+  - Jacobian 座標橢圓曲線點運算
+  - 標量乘法（double-and-add 算法）
+  - **性能：540k keys/sec**（批次 16384，**38.6x 加速**）
+
+- ✅ **GPU 地址生成管線**
+  - GPU 隨機數生成（CuPy）
+  - GPU secp256k1 公鑰計算
+  - GPU SHA-256（Base58Check 校驗碼）
+  - CPU Keccak-256（GPU 版本開發中）
+  - CPU Base58 編碼
+  - **性能：~49k addr/s**（批次 4096）
+
+- ✅ **多種運行模式**
+  - **V1 Demo**：單地址生成與驗證
+  - **V2 Vanity**：靚號地址搜索
+    - CPU 模式
+    - GPU 模式（僅 secp256k1）
+    - GPU-FULL 模式（完整管線）
+
+- ✅ **完整測試套件**
+  - GPU 模運算測試（64 筆隨機樣本）
+  - GPU/CPU 一致性測試（16 筆隨機私鑰）
+  - Window4 優化測試（開發中）
+
+### 開發中功能
+
+- ⚠️ **GPU Keccak-256**
+  - CUDA kernel 已實現
+  - 存在 bug（CuPy API 限制）
+  - 目前使用 CPU 後備
+
+- ⚠️ **Window4 優化**
+  - 4-bit 視窗法標量乘法
+  - 預計算表已生成
+  - 驗證測試未通過（64/64 不匹配）
+
+---
+
+## 📊 性能指標
+
+### GPU secp256k1 性能（純計算）
+
+| 批次大小 | 時間 (ms) | 吞吐量 (keys/s) | 加速比 |
+|---------|----------|----------------|--------|
+| 256     | 19.2     | 13.3k          | 1.0x   |
+| 1024    | 19.5     | 52.5k          | 3.9x   |
+| 4096    | 21.8     | 187.9k         | 14.1x  |
+| 16384   | 30.3     | 540.6k         | **38.6x** |
+
+### 完整地址生成性能
+
+| 批次大小 | 時間 (ms) | 吞吐量 (addr/s) | 備註 |
+|---------|----------|----------------|------|
+| 256     | 82.4     | 3.1k           | 含 CPU Keccak |
+| 1024    | 83.0     | 12.3k          | 含 CPU Keccak |
+| 4096    | 83.5     | 49.0k          | 含 CPU Keccak |
+
+### GPU-FULL 模式實測
+
+```bash
+# 測試命令
+python -m tron_vanity.v2_vanity --prefix T7 --threads 0 --gpu-batch 4096 --timeout 10
+
+# 結果
+總處理：450,000 地址
+總時間：10 秒
+平均速度：~45k addr/s
+加速比：3-5x（相比純 CPU）
+```
+
+---
+
+## 🚀 安裝說明
+
+### 系統要求
+
+- **操作系統**：Linux（推薦 Ubuntu 20.04+）
+- **Python**：3.8+
+- **CUDA**：11.0+（GPU 模式）
+- **GPU**：NVIDIA GPU with Compute Capability 6.0+
+
+### 🎯 生產環境硬件規格（重要）
+
+> **⚠️ 性能優化提醒**：本項目的所有性能測試和優化都是基於以下硬件環境進行的。為了獲得最佳性能，建議在相同或更高規格的硬件上運行。
+
+**當前生產環境配置**：
+
+| 組件 | 規格 | 說明 |
+|------|------|------|
+| **操作系統** | Ubuntu 20.04.6 LTS (Focal Fossa) | Linux Kernel 5.15.0-1088-gcp |
+| **CPU** | Intel Xeon @ 2.20GHz | 4 vCPUs (2 cores, 2 threads/core) |
+| **內存** | 16 GB | 可用 ~12 GB |
+| **GPU** | **NVIDIA L4** | 23 GB VRAM |
+| **GPU 架構** | Ada Lovelace | Compute Capability **8.9** |
+| **CUDA Driver** | 535.261.03 | Driver API 12.2 |
+| **CUDA Runtime** | 12.0.6 | Runtime API 12.6 |
+| **平台** | Google Cloud Platform | instance-20250725-173413 |
+
+**關鍵性能參數**：
+- **GPU 記憶體**：23 GB（足夠處理大批次）
+- **Compute Capability 8.9**：支持最新 CUDA 特性
+- **推薦批次大小**：
+  - GPU secp256k1：16384（最佳性能）
+  - 完整地址生成：4096-8192
+  - GPU-FULL 模式：4096
+
+**性能基準**（基於此硬件）：
+- GPU secp256k1：540k keys/s（批次 16384）
+- 完整地址生成：~49k addr/s（批次 4096）
+- GPU-FULL 模式：~45k addr/s
+
+**硬件升級建議**：
+- 更高端 GPU（如 A100、H100）可獲得更好性能
+- 更多 CPU 核心可提升 CPU 模式性能
+- 更大內存可支持更大批次處理
+
+> **給開發者的提醒**：
+> 1. 所有代碼優化都針對 NVIDIA L4 (Compute Capability 8.9)
+> 2. 批次大小參數已針對 23GB VRAM 優化
+> 3. 如使用不同硬件，可能需要調整批次大小
+> 4. 性能數據僅供參考，實際性能取決於硬件配置
+
+### 依賴安裝
+
+```bash
+# 1. 克隆倉庫
+git clone https://github.com/xu666xu888-ai/tron.git
+cd tron
+
+# 2. 創建虛擬環境（推薦）
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. 安裝依賴
+pip install -r requirements.txt
+
+# 4. 驗證環境
+python scripts/check_env.py
+```
+
+### requirements.txt
+
+```
+# 核心依賴
+tronpy>=0.4.0
+coincurve>=18.0.0
+pysha3>=1.0.2
+base58>=2.1.1
+
+# GPU 加速（可選）
+cupy-cuda11x>=12.0.0  # 根據 CUDA 版本選擇
+
+# 開發工具
+pytest>=7.0.0
+```
+
+---
+
+## 🎮 快速開始
+
+### 1. 環境檢查
+
+```bash
+python scripts/check_env.py
+```
+
+**預期輸出**：
+```
+✅ Python 版本: 3.8.10
+✅ tronpy 已安裝
+✅ coincurve 已安裝
+✅ CuPy 已安裝
+✅ CUDA 可用
+✅ GPU 設備: NVIDIA GeForce RTX 3090
+```
+
+### 2. V1 Demo - 單地址生成
+
+```bash
+# 生成隨機地址
+PYTHONPATH=src python -m tron_vanity.v1_demo
+
+# 從指定私鑰生成
+PYTHONPATH=src python -m tron_vanity.v1_demo --privkey-hex <64位十六進位>
+```
+
+**預期輸出**：
+```
+私鑰: a1b2c3d4...
+公鑰: 04abcd...
+地址: T7XYZ...
+tronpy_match: True
+is_valid_tron_base58: True
+validateaddress: True (需要 TRON_PRO_API_KEY)
+```
+
+### 3. V2 Vanity - 靚號搜索
+
+#### CPU 模式
+```bash
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 4 \
+  --batch 2048 \
+  --timeout 30
+```
+
+#### GPU 模式（僅 secp256k1）
+```bash
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 0 \
+  --gpu-batch 4096 \
+  --timeout 30
+```
+
+#### GPU-FULL 模式（完整管線）
+```bash
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 0 \
+  --gpu-full \
+  --gpu-batch 4096 \
+  --timeout 30
+```
+
+---
+
+## ✅ 開發進度
+
+### 已完成 ✅
+
+- [x] **GPU secp256k1 實現**（583 行 CUDA kernel）
+  - 256-bit 模運算
+  - 橢圓曲線點運算
+  - 標量乘法
+  - 性能：540k keys/s（38.6x 加速）
+
+- [x] **GPU 地址生成管線**
+  - GPU 隨機數
+  - GPU secp256k1
+  - GPU SHA-256
+  - 性能：~49k addr/s
+
+- [x] **GPU-FULL 模式整合**
+  - 成功運行測試
+  - 平均 ~45k addr/s
+  - 3-5x 實際加速
+
+- [x] **測試套件**
+  - GPU 模運算測試 ✅
+  - GPU/CPU 一致性測試 ✅
+  - 環境檢查腳本 ✅
+
+### 進行中 ⚠️
+
+- [ ] **GPU Keccak-256**
+  - CUDA kernel 已實現
+  - 存在 bug（CuPy `bitwise_xor.reduce` 不支持）
+  - 需要改用純 CUDA kernel
+
+- [ ] **Window4 優化**
+  - 預計算表已生成
+  - 驗證測試未通過
+  - 需要修復 nibble 切割邏輯
+
+### 待辦 📋
+
+- [ ] 修復 GPU Keccak-256
+- [ ] 修復 Window4 優化
+- [ ] GPU Base58 編碼
+- [ ] 完整 benchmark
+- [ ] 性能調優
+- [ ] 文檔完善
+
+---
+
+## 🔧 技術要點
+
+### 1. TRON 地址生成流程
+
+```
+私鑰 (32 bytes)
+    ↓
+secp256k1 點乘 (k * G)
+    ↓
+公鑰 (64 bytes: X || Y)
+    ↓
+Keccak-256(公鑰)
+    ↓
+取後 20 bytes
+    ↓
+添加前綴 0x41
+    ↓
+SHA-256(SHA-256(data))
+    ↓
+取前 4 bytes 作為校驗碼
+    ↓
+Base58 編碼
+    ↓
+TRON 地址 (T...)
+```
+
+### 2. secp256k1 橢圓曲線
+
+**曲線方程**：y² = x³ + 7 (mod p)
+
+**參數**：
+- **p**（素數）：2^256 - 2^32 - 977
+- **n**（階）：FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+- **G**（基點）：
+  - Gx = 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+  - Gy = 483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+**優化技術**：
+- **Jacobian 座標**：避免昂貴的模逆運算
+- **特殊素數快速約簡**：利用 p 的特殊形式
+- **批量並行處理**：每個 GPU 線程處理一個私鑰
+
+### 3. Keccak-256 注意事項
+
+**Padding 規則**（pad10*1）：
+- Input rate = 136 bytes
+- 64 bytes XY 吸收後：
+  - Lane 8 XOR 0x01（起始位）
+  - Lane 16 XOR 0x80 << 56（尾端位）
+
+**實現難點**：
+- Rho/Pi/Chi 步驟需嚴格依照規範
+- 位元序處理（大端/小端）
+- CuPy API 限制（不支持某些操作）
+
+### 4. Window4 預計算表
+
+**概念**：
+- 預計算 1G, 2G, ..., 15G
+- 將 256-bit 標量切成 64 個 4-bit nibbles
+- 每次處理 4 bits，減少點加法次數
+
+**當前問題**：
+- nibble 採樣順序（MSB vs LSB）
+- 初始 state 處理
+- 預計算表 limb 順序
+
+### 5. GPU-FULL 管線
+
+**組件**：
+1. GPU 隨機數生成（CuPy）
+2. GPU secp256k1（CUDA kernel）
+3. CPU Keccak-256（GPU 版本有 bug）
+4. GPU SHA-256（Base58Check）
+5. CPU Base58 編碼
+
+**性能瓶頸**：
+- Keccak-256 在 CPU（佔 ~40% 時間）
+- Base58 編碼在 CPU（佔 ~10% 時間）
+- 數據傳輸開銷（GPU ↔ CPU）
+
+---
+
+## 🔜 待辦清單
+
+### 高優先級 🔴
+
+1. **修復 GPU Keccak-256**
+   - [ ] 實現純 CUDA kernel（避免 CuPy API 限制）
+   - [ ] 逐筆比對（0 bytes、空訊息、隨機 64 bytes）
+   - [ ] 確認 Rho/Pi/Chi/Omega 函式正確性
+   - [ ] 驗證常數表
+
+2. **修復 Window4 ECC 內核**
+   - [ ] 核對預計算表輸出（G1..G15）
+   - [ ] 優化 nibble 擷取與 scalar 解析
+   - [ ] 確保與位元掃描內核結果一致
+
+### 中優先級 🟡
+
+3. **性能優化**
+   - [ ] GPU Base58 編碼（批次化字串處理）
+   - [ ] 減少 GPU ↔ CPU 數據傳輸
+   - [ ] 優化批次大小選擇
+   - [ ] 記憶體池管理
+
+4. **完整測試**
+   - [ ] Keccak & Window4 修正後重新 benchmark
+   - [ ] GPU Keccak 單獨 throughput 測試
+   - [ ] 壓力測試（長時間運行）
+   - [ ] 邊界條件測試
+
+### 低優先級 🟢
+
+5. **文檔與工具**
+   - [ ] 更新 devbook.md
+   - [ ] 添加 API 文檔
+   - [ ] 創建使用教程
+   - [ ] 添加更多示例
+
+6. **功能增強**
+   - [ ] 支持更多地址模式（正則表達式）
+   - [ ] 多 GPU 支持
+   - [ ] 進度保存與恢復
+   - [ ] Web UI
+
+---
+
+## 📝 常用指令
+
+### 環境檢查
+
+```bash
+# 檢查所有依賴
+python scripts/check_env.py
+
+# 檢查 CUDA 版本
+nvcc --version
+
+# 檢查 GPU 信息
+nvidia-smi
+```
+
+### 測試命令
+
+```bash
+# GPU vs CPU 公鑰比對（16 筆）
+PYTHONPATH=src python -m tron_vanity.test_gpu_vs_cpu --n 16
+
+# GPU 模運算測試（64 筆）
+PYTHONPATH=src python -m tron_vanity.test_mod_arith_gpu --n 64
+
+# Window4 vs 參考內核比對（64 筆）
+PYTHONPATH=src python -m tron_vanity.test_ecc_w4_vs_ref --n 64
+```
+
+### 性能測試
+
+```bash
+# 基準測試（100k 地址）
+export VANITY_EXPERIMENTAL_GPU_SECP=1
+PYTHONPATH=src python3 scripts/benchmark.py
+
+# GPU Keccak 單筆測試
+PYTHONPATH=src python3 -c "
+import cupy as cp, sha3
+from tron_vanity.gpu_keccak import keccak256_xy_batch
+x = cp.zeros((1,64), dtype=cp.uint8)
+gpu = bytes(cp.asnumpy(keccak256_xy_batch(x))[0])
+cpu = sha3.keccak_256(bytes(64)).digest()
+print('match?', gpu == cpu)
+print('GPU:', gpu.hex())
+print('CPU:', cpu.hex())
+"
+```
+
+### V1 Demo
+
+```bash
+# 生成隨機地址
+PYTHONPATH=src python -m tron_vanity.v1_demo
+
+# 從私鑰生成
+PYTHONPATH=src python -m tron_vanity.v1_demo \
+  --privkey-hex a1b2c3d4e5f6...
+```
+
+### V2 Vanity
+
+```bash
+# CPU 模式（4 線程）
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 4 \
+  --batch 2048 \
+  --timeout 30
+
+# GPU 模式（僅 secp256k1）
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 0 \
+  --gpu-batch 4096 \
+  --timeout 30
+
+# GPU-FULL 模式（完整管線）
+PYTHONPATH=src python -m tron_vanity.v2_vanity \
+  --prefix T7 \
+  --threads 0 \
+  --gpu-full \
+  --gpu-batch 4096 \
+  --timeout 30
+```
+
+---
+
+## 📁 項目結構
+
+```
+tron-vanity/
+├── README.md                    # 本文件
+├── requirements.txt             # Python 依賴
+├── .gitignore                   # Git 忽略規則
+│
+├── scripts/                     # 工具腳本
+│   ├── check_env.py            # 環境檢查
+│   ├── benchmark.py            # 性能測試
+│   └── test_gpu_v2.py          # GPU 測試
+│
+├── src/tron_vanity/            # 核心代碼
+│   ├── __init__.py             # 包初始化
+│   │
+│   ├── addr.py                 # CPU 地址生成
+│   ├── validate.py             # 地址驗證
+│   │
+│   ├── gpu_random.py           # GPU 隨機數
+│   ├── gpu_secp256k1.py        # GPU secp256k1 (583 行)
+│   ├── gpu_secp256k1_v2.py     # GPU secp256k1 Window4
+│   ├── gpu_keccak.py           # GPU Keccak-256 (開發中)
+│   ├── gpu_addr.py             # GPU 地址生成管線
+│   │
+│   ├── v1_demo.py              # V1 演示模式
+│   ├── v2_vanity.py            # V2 靚號搜索
+│   │
+│   ├── test_mod_arith_gpu.py   # GPU 模運算測試
+│   ├── test_gpu_vs_cpu.py      # GPU/CPU 一致性測試
+│   ├── test_ecc_w4_vs_ref.py   # Window4 測試
+│   └── test_secp256k1_debug.py # secp256k1 調試
+│
+├── agent.md                     # Agent 開發日誌
+├── claude.md                    # Claude 對話記錄
+└── devbook.md                   # 開發手冊
+```
+
+---
+
+## 🤝 貢獻指南
+
+歡迎貢獻！請遵循以下步驟：
+
+1. Fork 本倉庫
+2. 創建特性分支（`git checkout -b feature/AmazingFeature`）
+3. 提交更改（`git commit -m 'Add some AmazingFeature'`）
+4. 推送到分支（`git push origin feature/AmazingFeature`）
+5. 開啟 Pull Request
+
+### 代碼規範
+
+- 遵循 PEP 8
+- 添加類型註解
+- 編寫單元測試
+- 更新文檔
+
+---
+
+## ⚠️ 安全警告
+
+1. **私鑰安全**：
+   - 永遠不要分享您的私鑰
+   - 不要在公共網絡上傳輸私鑰
+   - 使用硬件錢包存儲重要私鑰
+
+2. **代碼審計**：
+   - 本項目仍在開發中
+   - GPU Keccak-256 和 Window4 尚未完成驗證
+   - 使用前請自行審計代碼
+
+3. **測試網優先**：
+   - 建議先在測試網測試
+   - 確認功能正常後再用於主網
+
+---
+
+## 📄 許可證
+
+本項目採用 MIT 許可證 - 詳見 [LICENSE](LICENSE) 文件
+
+---
+
+## 🙏 致謝
+
+- [tronpy](https://github.com/andelf/tronpy) - TRON Python SDK
+- [coincurve](https://github.com/ofek/coincurve) - secp256k1 綁定
+- [CuPy](https://cupy.dev/) - GPU 加速數組運算
+- TRON 社區
+
+---
+
+## 📞 聯繫方式
+
+- GitHub: [@xu666xu888-ai](https://github.com/xu666xu888-ai)
+- Email: xu666xu888@gmail.com
+
+---
+
+## 🔄 更新日誌
+
+### v0.1.0 (2025-01-13)
+
+**新增**：
+- ✅ 完整 GPU secp256k1 實現（540k keys/s）
+- ✅ GPU 地址生成管線（~49k addr/s）
+- ✅ GPU-FULL 模式（3-5x 加速）
+- ✅ V1 Demo 和 V2 Vanity 模式
+- ✅ 完整測試套件
+
+**已知問題**：
+- ⚠️ GPU Keccak-256 需要修復
+- ⚠️ Window4 優化需要修復
+- ⚠️ Base58 編碼仍在 CPU
+
+---
+
+> **提醒**：目前 GPU Keccak-256 與 Window4 仍未完成驗證，任何切換到 GPU-FULL 模式前請確認已設 fallback 或留意輸出正確性。待上述修正完成後再正式導入。
+
+> **下次開發重點**：
+> 1. 修復 GPU Keccak-256（實現純 CUDA kernel）
+> 2. 修復 Window4 優化（核對預計算表與 nibble 切割）
+> 3. 執行完整 benchmark 並更新性能數據
+> 4. 優化 GPU Base58 編碼
+
+祝開發順利！🚀
