@@ -15,6 +15,7 @@ GPU Keccak-256（針對 64 bytes 輸入的批次運算）
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 try:
     import cupy as cp
@@ -257,7 +258,11 @@ _ker_full = _mod.get_function("keccak256_64")
 _ker_addr = _mod.get_function("keccak256_64_addr")
 
 
-def keccak256_xy_batch(pubkey_xy_gpu: "cp.ndarray", address_only: bool = False) -> "cp.ndarray":
+def keccak256_xy_batch(
+    pubkey_xy_gpu: "cp.ndarray",
+    address_only: bool = False,
+    out: Optional["cp.ndarray"] = None,
+) -> "cp.ndarray":
     """GPU 計算多筆 Keccak-256（輸入固定 64 bytes）。
 
     Args:
@@ -275,19 +280,37 @@ def keccak256_xy_batch(pubkey_xy_gpu: "cp.ndarray", address_only: bool = False) 
         n = xy_gpu.shape[0]
         if n == 0:
             length = 20 if address_only else 32
+            if out is not None:
+                if out.shape[0] != 0 or out.shape[1] != length or out.dtype != cp.uint8:
+                    raise ValueError("out 陣列大小需為 (0,%d)" % length)
+                return out
             return cp.empty((0, length), dtype=cp.uint8)
         stride_in = int(xy_gpu.strides[0])
         threads = _KECCAK_THREADS
         blocks = (n + threads - 1) // threads
         if address_only:
-            out = cp.empty((n, 20), dtype=cp.uint8)
-            stride_out = int(out.strides[0])
-            _ker_addr((blocks,), (threads,), (xy_gpu, out, cp.int32(stride_in), cp.int32(stride_out), cp.int32(n)))
+            if out is None:
+                out_gpu = cp.empty((n, 20), dtype=cp.uint8)
+            else:
+                if out.dtype != cp.uint8 or out.ndim != 2 or out.shape[0] != n or out.shape[1] != 20:
+                    raise ValueError("out 需為 uint8 (N,20)")
+                if out.strides[1] != 1:
+                    raise ValueError("out 必須為連續記憶體陣列")
+                out_gpu = out
+            stride_out = int(out_gpu.strides[0])
+            _ker_addr((blocks,), (threads,), (xy_gpu, out_gpu, cp.int32(stride_in), cp.int32(stride_out), cp.int32(n)))
         else:
-            out = cp.empty((n, 32), dtype=cp.uint8)
-            stride_out = int(out.strides[0])
-            _ker_full((blocks,), (threads,), (xy_gpu, out, cp.int32(stride_in), cp.int32(stride_out), cp.int32(n)))
-        return out
+            if out is None:
+                out_gpu = cp.empty((n, 32), dtype=cp.uint8)
+            else:
+                if out.dtype != cp.uint8 or out.ndim != 2 or out.shape[0] != n or out.shape[1] != 32:
+                    raise ValueError("out 需為 uint8 (N,32)")
+                if out.strides[1] != 1:
+                    raise ValueError("out 必須為連續記憶體陣列")
+                out_gpu = out
+            stride_out = int(out_gpu.strides[0])
+            _ker_full((blocks,), (threads,), (xy_gpu, out_gpu, cp.int32(stride_in), cp.int32(stride_out), cp.int32(n)))
+        return out_gpu
     except Exception:
         import numpy as np, sha3
         xy_cpu: np.ndarray = cp.asnumpy(pubkey_xy_gpu)
@@ -301,7 +324,11 @@ def keccak256_xy_batch(pubkey_xy_gpu: "cp.ndarray", address_only: bool = False) 
                 out[i, :] = np.frombuffer(digest[-20:], dtype=np.uint8)
             else:
                 out[i, :] = np.frombuffer(digest, dtype=np.uint8)
-        return cp.asarray(out)
+        out_gpu = cp.asarray(out)
+        if out is not None:
+            out[...] = out_gpu
+            return out
+        return out_gpu
 
 
 __all__ = ["keccak256_xy_batch"]

@@ -76,6 +76,10 @@ def _select_cupy_package(system_info: Optional[SystemInfo]) -> Tuple[str, str]:
                 major = gpu.cuda_version.split(".")[0]
                 if major.isdigit():
                     major_num = int(major)
+                    if major_num >= 13:
+                        return "cupy-cuda12x", (
+                            f"偵測到 CUDA {gpu.cuda_version}，目前僅支援 CUDA 12 系列，將安裝 cupy-cuda12x"
+                        )
                     if major_num >= 12:
                         return "cupy-cuda12x", f"偵測到 CUDA {gpu.cuda_version}"
                     if major_num == 11:
@@ -86,6 +90,16 @@ def _select_cupy_package(system_info: Optional[SystemInfo]) -> Tuple[str, str]:
 
 def _pip_install(package: str) -> InstallResult:
     """使用 pip 安裝指定套件。"""
+
+    if (
+        sys.platform.startswith("win")
+        and sys.version_info >= (3, 13)
+        and (package.lower().startswith("cupy") or package.lower().startswith("numpy") or package.lower() == "cupy")
+    ):
+        message = (
+            "Windows + Python 3.13 尚無預編譯 wheel，請改用 Python 3.10~3.12 並安裝對應的 cupy/numpy wheel。"
+        )
+        return InstallResult(package=package, success=False, message=message)
 
     command = [sys.executable, "-m", "pip", "install", package]
     result = subprocess.run(
@@ -134,7 +148,8 @@ def _add_manual_actions(report: AutoInstallReport) -> None:
     for res in report.install_results:
         if res.success:
             continue
-        msg = f"安裝 {res.package} 失敗，請手動檢查後再執行 `pip install {res.package}`"
+        detail = f"：{res.message}" if res.message else ""
+        msg = f"安裝 {res.package} 失敗{detail}。請手動安裝或調整環境後再執行 `pip install {res.package}`"
         if msg not in existing:
             report.manual_actions.append(msg)
             existing.add(msg)

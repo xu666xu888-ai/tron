@@ -198,6 +198,8 @@ python scripts/check_env.py
 
 - `python -m tron_vanity.cli` 將檢測 Python 依賴並嘗試透過 `pip` 安裝缺失模組（如 `cupy`, `rich`, `psutil`, `GPUtil`）。
 - 針對 CuPy 會依據 CUDA 版本提示安裝 `cupy-cuda11x` / `cupy-cuda12x`；若無 GPU，可改裝 `cupy`（CPU 版本）。
+- **Windows 注意事項**：若使用 Python 3.12 以上（尤其是 3.13），官方尚未提供 `numpy`/`cupy` 預編譯 wheel，`pip install` 會出現 `ERROR: Exception`。建議改用 Python 3.10~3.12，並手動安裝對應版本的預編譯 wheel。
+- **RTX 40 系列建議**：目前僅驗證 CUDA 12.x，可直接安裝 `cupy-cuda12x`。若安裝 CUDA 13 可能導致 CuPy 仍回退至 12 系列，請以 CUDA 12 官方版本為準。
 - **CUDA Toolkit、NVIDIA Driver、Node.js 等系統級工具需使用者自行安裝**，CLI 會提供官方指引與命令範例，避免在未知環境中自動變更系統。
 - 可使用以下環境變數覆蓋硬體自適應設定：
   - `VANITY_WNAF_MAX_BATCH`、`VANITY_STREAM_COUNT_DEFAULT`、`VANITY_MAX_PENDING_MULTIPLIER`

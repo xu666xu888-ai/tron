@@ -19,8 +19,9 @@ import hashlib
 import asyncio
 import threading
 import logging
-from typing import List, Tuple, Optional, Union, Sequence
-from dataclasses import dataclass
+import time
+from typing import Dict, List, Tuple, Optional, Union, Sequence
+from dataclasses import dataclass, field
 from concurrent.futures import Future
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,103 @@ try:
 except Exception:
     _warmup_window4_table = None
 
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+@dataclass
+class _DeviceState:
+    pool: "_ArrayPool"
+    rng: "cp.random.Generator"
+
+
+class _ArrayPool:
+    """簡易 GPU 陣列池，避免重覆配置大尺寸緩衝。"""
+
+    def __init__(self) -> None:
+        self._store: Dict[Tuple[str, Optional[int]], List["cp.ndarray"]] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, rows: int, cols: Optional[int], dtype: "cp.dtype") -> Tuple["cp.ndarray", "cp.ndarray"]:
+        dtype_obj = cp.dtype(dtype)
+        key = (dtype_obj.str, cols)
+        with self._lock:
+            candidates = self._store.get(key, [])
+            for idx, arr in enumerate(candidates):
+                if arr.shape[0] >= rows:
+                    view = arr[:rows] if cols is None else arr[:rows, :]
+                    candidates.pop(idx)
+                    return view, arr
+        capacity = _aligned_capacity(rows)
+        shape = (capacity,) if cols is None else (capacity, cols)
+        arr = cp.empty(shape, dtype=dtype)
+        view = arr[:rows] if cols is None else arr[:rows, :]
+        return view, arr
+
+    def release(self, owner: Optional["cp.ndarray"]) -> None:
+        if owner is None:
+            return
+        dtype_obj = cp.dtype(owner.dtype)
+        key = (dtype_obj.str, owner.shape[1] if owner.ndim == 2 else None)
+        with self._lock:
+            self._store.setdefault(key, []).append(owner)
+
+
+_DEVICE_STATE_LOCK = threading.Lock()
+_DEVICE_STATES: Dict[int, _DeviceState] = {}
+
+
+def _aligned_capacity(rows: int) -> int:
+    if rows <= 0:
+        return 0
+    block = 8192
+    return ((rows + block - 1) // block) * block
+
+
+def _get_device_state() -> _DeviceState:
+    dev_id = int(cp.cuda.Device())
+    with _DEVICE_STATE_LOCK:
+        state = _DEVICE_STATES.get(dev_id)
+        if state is None:
+            rng = cp.random.default_rng()
+            state = _DeviceState(pool=_ArrayPool(), rng=rng)
+            _DEVICE_STATES[dev_id] = state
+        return state
+
+
+def _acquire_gpu_array(rows: int, cols: Optional[int], dtype: "cp.dtype") -> Tuple["cp.ndarray", "cp.ndarray"]:
+    state = _get_device_state()
+    return state.pool.acquire(rows, cols, dtype)
+
+
+def _release_gpu_array(owner: Optional["cp.ndarray"]) -> None:
+    if owner is None:
+        return
+    state = _get_device_state()
+    state.pool.release(owner)
+
+
+def _fill_random_uint8(arr: "cp.ndarray") -> None:
+    if arr.dtype != cp.uint8:
+        raise ValueError("隨機緩衝需為 uint8")
+    arr[...] = cp.random.randint(0, 256, size=arr.shape, dtype=cp.uint8)
+
+
+def _compute_suffix_mod_params(suffix_bytes: Optional[bytes]) -> Optional[Tuple[int, int]]:
+    if not suffix_bytes:
+        return None
+    value = 0
+    mod = 1
+    for ch in reversed(suffix_bytes):
+        try:
+            digit = _BASE58_ALPHABET.index(chr(ch))
+        except ValueError as exc:
+            raise ValueError("suffix 包含非 Base58 字元") from exc
+        value += digit * mod
+        mod *= 58
+        if mod >= (1 << 63):
+            raise ValueError("suffix 長度過長，超出快速模運算支援範圍")
+    return value, mod
+
 _USE_WNAF_DEFAULT = True
 if os.environ.get("VANITY_DISABLE_WNAF") == "1":
     _USE_WNAF_DEFAULT = False
@@ -80,9 +178,31 @@ _WNAF_BROKEN = False
 _WNAF_SIZE_LOGGED = False
 _WNAF_LAST_USED = False
 
+
+def _wnaf_record_success(batch_size: int) -> None:
+    global _WNAF_ADAPTIVE_LIMIT
+    if _WNAF_ADAPTIVE_LIMIT <= 0:
+        return
+    if batch_size > _WNAF_ADAPTIVE_LIMIT:
+        _WNAF_ADAPTIVE_LIMIT = batch_size
+        logger.info("[WNAF] 自適應門檻提升至 %d", _WNAF_ADAPTIVE_LIMIT)
+
+
+def _wnaf_record_failure(batch_size: int) -> None:
+    global _WNAF_ADAPTIVE_LIMIT
+    if _WNAF_ADAPTIVE_LIMIT <= 0:
+        return
+    if batch_size >= _WNAF_ADAPTIVE_LIMIT:
+        new_limit = max(_WNAF_BASE_THRESHOLD, batch_size // 2)
+        if new_limit < _WNAF_ADAPTIVE_LIMIT:
+            _WNAF_ADAPTIVE_LIMIT = new_limit
+            logger.warning("[WNAF] 內核在批次 %d 失敗，自適應門檻降至 %d", batch_size, _WNAF_ADAPTIVE_LIMIT)
+
 _DEFAULT_DYNAMIC_BATCHES = _HARDWARE_CFG.default_batches
 
 _WNAF_BATCH_THRESHOLD = int(os.environ.get("VANITY_WNAF_MAX_BATCH", str(_HARDWARE_CFG.wnaf_threshold)))
+_WNAF_BASE_THRESHOLD = _WNAF_BATCH_THRESHOLD
+_WNAF_ADAPTIVE_LIMIT = _WNAF_BATCH_THRESHOLD if _WNAF_BATCH_THRESHOLD > 0 else 0
 _BASE_STREAM_COUNT = int(os.environ.get("VANITY_STREAM_COUNT_DEFAULT", str(_HARDWARE_CFG.default_streams)))
 _MAX_PENDING_MULTIPLIER_DEFAULT = int(os.environ.get("VANITY_MAX_PENDING_MULTIPLIER", str(_HARDWARE_CFG.max_pending_multiplier)))
 
@@ -191,6 +311,15 @@ def _select_batch_size(remain: int, batch_plan: Sequence[int], stream_count: int
     if target <= 0:
         target = min(remain, batch_plan[0])
     return max(1, target)
+
+
+def _snap_batch_to_plan(value: int, batch_plan: Sequence[int]) -> int:
+    if not batch_plan:
+        return value
+    for cand in batch_plan:
+        if cand >= value:
+            return cand
+    return batch_plan[-1]
 
 # -------------------------
 # GPU SHA-256（單區塊訊息）
@@ -532,6 +661,71 @@ extern "C" __global__ void tron21_to_base58(
 _base58_fused_mod = cp.RawModule(code=_BASE58_FUSED_KERNEL, options=("-std=c++11",))
 _base58_fused_kernel = _base58_fused_mod.get_function("tron21_to_base58")
 
+_PREFIX_FILTER_KERNEL = r"""
+extern "C" __global__ void prefix_filter(
+    const unsigned char* __restrict__ ascii_matrix,
+    const int* __restrict__ lens,
+    const unsigned char* __restrict__ prefix,
+    const int prefix_len,
+    const int stride,
+    const int total,
+    unsigned char* __restrict__ mask_out
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    unsigned char match = 1;
+    const int cur_len = lens[idx];
+    if (cur_len < prefix_len) {
+        match = 0;
+    } else {
+        const unsigned char* row = ascii_matrix + (size_t)idx * stride;
+        for (int i = 0; i < prefix_len; ++i) {
+            if (row[i] != prefix[i]) {
+                match = 0;
+                break;
+            }
+        }
+    }
+    mask_out[idx] = match;
+}
+"""
+
+_prefix_filter_mod = cp.RawModule(code=_PREFIX_FILTER_KERNEL, options=("-std=c++11",))
+_prefix_filter_kernel = _prefix_filter_mod.get_function("prefix_filter")
+
+_SUFFIX_FILTER_KERNEL = r"""
+extern "C" __global__ void suffix_mod_filter(
+    const unsigned char* __restrict__ tron21,
+    const unsigned char* __restrict__ checksum,
+    unsigned char* __restrict__ mask,
+    const unsigned long long mod_base,
+    const unsigned long long target,
+    const int n
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    unsigned long long rem = 0ULL;
+    const unsigned char* tron_ptr = tron21 + (size_t)idx * 21;
+    #pragma unroll
+    for (int i = 0; i < 21; ++i) {
+        rem = (rem * 256ULL + (unsigned long long)tron_ptr[i]) % mod_base;
+    }
+    const unsigned char* chk_ptr = checksum + (size_t)idx * 4;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        rem = (rem * 256ULL + (unsigned long long)chk_ptr[j]) % mod_base;
+    }
+    mask[idx] = (rem == target) ? 1 : 0;
+}
+"""
+
+_suffix_filter_mod = cp.RawModule(code=_SUFFIX_FILTER_KERNEL, options=("-std=c++11",))
+_suffix_filter_kernel = _suffix_filter_mod.get_function("suffix_mod_filter")
+
 
 def gpu_sha256_oneblock_batch(msgs_gpu: "cp.ndarray", lens_gpu: "cp.ndarray") -> "cp.ndarray":
     """在 GPU 上計算多筆 SHA-256（限制：每筆長度 <= 55，單區塊）。
@@ -580,7 +774,10 @@ def _keccak_256(data: bytes) -> bytes:
     return k.digest()
 
 
-def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
+def gpu_secp256k1_batch(
+    privkeys_gpu: "cp.ndarray",
+    out: Optional["cp.ndarray"] = None,
+) -> "cp.ndarray":
     """
     在 GPU 上批量計算 secp256k1 公鑰（未壓縮 65 bytes）。
     
@@ -596,10 +793,14 @@ def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
     - `uint8` 形狀為 (N, 65) 的 GPU 陣列（未壓縮公鑰：0x04 + X(32) + Y(32)）
     """
     from .gpu_secp256k1 import gpu_secp256k1_batch as _gpu_secp256k1
-    return _gpu_secp256k1(privkeys_gpu)
+    return _gpu_secp256k1(privkeys_gpu, out=out)
 
 
-def gpu_keccak256_batch(pubkey_xy_gpu: "cp.ndarray", address_only: bool = False) -> "cp.ndarray":
+def gpu_keccak256_batch(
+    pubkey_xy_gpu: "cp.ndarray",
+    address_only: bool = False,
+    out: Optional["cp.ndarray"] = None,
+) -> "cp.ndarray":
     """
     批量 Keccak-256：
     - 若可用 GPU kernel，使用 keccak256_xy_batch
@@ -610,31 +811,54 @@ def gpu_keccak256_batch(pubkey_xy_gpu: "cp.ndarray", address_only: bool = False)
 
     if _gpu_keccak256_xy_batch is not None:
         try:
-            return _gpu_keccak256_xy_batch(pubkey_xy_gpu, address_only=address_only)
+            return _gpu_keccak256_xy_batch(pubkey_xy_gpu, address_only=address_only, out=out)
         except Exception:
             pass
 
     xy_cpu: np.ndarray = cp.asnumpy(pubkey_xy_gpu)
     out_len = 20 if address_only else 32
-    out = np.empty((xy_cpu.shape[0], out_len), dtype=np.uint8)
+    out_cpu = np.empty((xy_cpu.shape[0], out_len), dtype=np.uint8)
     for i in range(xy_cpu.shape[0]):
         h = _keccak_256(bytes(xy_cpu[i]))
         if address_only:
-            out[i, :] = np.frombuffer(h[-20:], dtype=np.uint8)
+            out_cpu[i, :] = np.frombuffer(h[-20:], dtype=np.uint8)
         else:
-            out[i, :] = np.frombuffer(h, dtype=np.uint8)
-    return cp.asarray(out)
+            out_cpu[i, :] = np.frombuffer(h, dtype=np.uint8)
+    out_gpu = cp.asarray(out_cpu)
+    if out is not None:
+        out[...] = out_gpu
+        return out
+    return out_gpu
 
 
-def _gpu_base58check_raw(tron21_gpu: "cp.ndarray") -> Tuple["cp.ndarray", "cp.ndarray"]:
+def _gpu_base58check_raw(
+    tron21_gpu: "cp.ndarray",
+    ascii_buf: Optional["cp.ndarray"] = None,
+    lens_buf: Optional["cp.ndarray"] = None,
+) -> Tuple["cp.ndarray", "cp.ndarray"]:
     """回傳 Base58Check 的 ASCII 緩衝與對應長度。"""
     if tron21_gpu.dtype != cp.uint8 or tron21_gpu.ndim != 2 or tron21_gpu.shape[1] != 21:
         raise ValueError("tron21_gpu 需為 uint8 (N,21)")
 
     N = tron21_gpu.shape[0]
     tron21_contig = cp.ascontiguousarray(tron21_gpu)
-    ascii_gpu = cp.zeros((N, 60), dtype=cp.uint8)
-    lens_gpu = cp.zeros((N,), dtype=cp.int32)
+    if ascii_buf is not None:
+        if ascii_buf.dtype != cp.uint8 or ascii_buf.ndim != 2 or ascii_buf.shape[1] < 60:
+            raise ValueError("ascii_buf 需為 uint8 (?,60)")
+        if ascii_buf.strides[1] != 1:
+            raise ValueError("ascii_buf 必須為連續記憶體")
+        if ascii_buf.shape[0] < N:
+            raise ValueError("ascii_buf 行數不足")
+        ascii_gpu = ascii_buf[:N, :]
+    else:
+        ascii_gpu = cp.zeros((N, 60), dtype=cp.uint8)
+    if lens_buf is not None:
+        if lens_buf.dtype != cp.int32 or lens_buf.ndim != 1 or lens_buf.shape[0] < N:
+            raise ValueError("lens_buf 需為 int32 (N,)")
+        lens_gpu = lens_buf[:N]
+        lens_gpu.fill(0)
+    else:
+        lens_gpu = cp.zeros((N,), dtype=cp.int32)
     threads = _BASE58_THREADS
     blocks = (N + threads - 1) // threads
     try:
@@ -696,6 +920,65 @@ class _BatchContext:
     size: int
     device_id: int
     cpu_future: Optional[Future] = None
+    buffer_owners: Dict[str, Optional["cp.ndarray"]] = field(default_factory=dict)
+
+
+def _release_context_buffers(ctx: _BatchContext) -> None:
+    if not ctx.buffer_owners:
+        return
+    with cp.cuda.Device(ctx.device_id):
+        for owner in ctx.buffer_owners.values():
+            _release_gpu_array(owner)
+    ctx.buffer_owners.clear()
+
+
+def _suffix_mod_filter(tron21_gpu: "cp.ndarray", target: int, mod_base: int) -> "cp.ndarray":
+    n = tron21_gpu.shape[0]
+    checksum_buf, checksum_owner = _acquire_gpu_array(n, 4, cp.uint8)
+    try:
+        lens21, lens21_owner = _acquire_gpu_array(n, None, cp.int32)
+        try:
+            lens21.fill(21)
+            d1 = gpu_sha256_oneblock_batch(tron21_gpu, lens21)
+        finally:
+            _release_gpu_array(lens21_owner)
+
+        lens32, lens32_owner = _acquire_gpu_array(n, None, cp.int32)
+        try:
+            lens32.fill(32)
+            d2 = gpu_sha256_oneblock_batch(d1, lens32)
+        finally:
+            _release_gpu_array(lens32_owner)
+
+        checksum_buf[:, :] = d2[:, :4]
+        if 'd1' in locals():
+            del d1
+        if 'd2' in locals():
+            del d2
+
+        mask_buf, mask_owner = _acquire_gpu_array(n, None, cp.uint8)
+        try:
+            threads = _BASE58_THREADS
+            blocks = (n + threads - 1) // threads
+            _suffix_filter_kernel(
+                (blocks,),
+                (threads,),
+                (
+                    tron21_gpu,
+                    checksum_buf,
+                    mask_buf,
+                    cp.uint64(mod_base),
+                    cp.uint64(target),
+                    cp.int32(n),
+                ),
+            )
+            mask_bool = mask_buf.view(cp.bool_)
+            hits_idx = cp.nonzero(mask_bool)[0]
+        finally:
+            _release_gpu_array(mask_owner)
+    finally:
+        _release_gpu_array(checksum_owner)
+    return hits_idx
 
 
 def _launch_batch(
@@ -706,30 +989,31 @@ def _launch_batch(
     suffix_gpu: Optional["cp.ndarray"],
     suf_len: int,
     use_wnaf_requested: bool,
+    suffix_mod_params: Optional[Tuple[int, int]],
 ) -> _BatchContext:
     ascii_gpu: Optional["cp.ndarray"] = None
     lens_gpu: Optional["cp.ndarray"] = None
     hits_idx: Optional["cp.ndarray"] = None
     fallback_cpu = False
-    global _WNAF_READY, _WNAF_BROKEN, _WNAF_LAST_USED
+    buffer_map: Dict[str, Optional["cp.ndarray"]] = {}
+    global _WNAF_READY, _WNAF_BROKEN, _WNAF_LAST_USED, _WNAF_SIZE_LOGGED
     device_id = int(cp.cuda.Device())
 
-    global _WNAF_SIZE_LOGGED
-    if not use_wnaf_requested and _USE_WNAF_DEFAULT:
-        if not _WNAF_SIZE_LOGGED:
-            logger.info(
-                "[WNAF] 批次 %d 超過門檻 %d，自動改用標準內核",
-                cur,
-                _WNAF_BATCH_THRESHOLD,
-            )
-            _WNAF_SIZE_LOGGED = True
+    if not use_wnaf_requested and _USE_WNAF_DEFAULT and not _WNAF_SIZE_LOGGED:
+        logger.info(
+            "[WNAF] 批次 %d 超過門檻 %d，自動改用標準內核",
+            cur,
+            _WNAF_BATCH_THRESHOLD,
+        )
+        _WNAF_SIZE_LOGGED = True
 
     _WNAF_LAST_USED = False
 
     with stream:
-        sk_gpu = cp.random.randint(0, 256, size=(cur, 32), dtype=cp.uint8)
+        sk_gpu, sk_owner = _acquire_gpu_array(cur, 32, cp.uint8)
+        buffer_map["sk"] = sk_owner
+        _fill_random_uint8(sk_gpu)
 
-        pub65_gpu: "cp.ndarray"
         use_kernel = (
             use_wnaf_requested
             and not _WNAF_BROKEN
@@ -746,36 +1030,84 @@ def _launch_batch(
                 _WNAF_BROKEN = True
                 use_kernel = False
 
+        pub65_gpu, pub_owner = _acquire_gpu_array(cur, 65, cp.uint8)
+        buffer_map["pub65"] = pub_owner
         if use_kernel:
             _WNAF_SIZE_LOGGED = False
             try:
-                pub65_gpu = secp_gpu_batch_w4(sk_gpu)
+                pub65_gpu = secp_gpu_batch_w4(sk_gpu, out=pub65_gpu)
                 _WNAF_LAST_USED = True
+                _wnaf_record_success(cur)
             except Exception:
                 _WNAF_BROKEN = True
                 logger.warning("[WNAF] Window4 核心執行異常，改用標準版", exc_info=True)
-                pub65_gpu = secp_gpu_batch(sk_gpu) if secp_gpu_batch is not None else gpu_secp256k1_batch(sk_gpu)
+                _wnaf_record_failure(cur)
+                if secp_gpu_batch is not None:
+                    pub65_gpu = secp_gpu_batch(sk_gpu, out=pub65_gpu)
+                else:
+                    pub65_gpu = gpu_secp256k1_batch(sk_gpu, out=pub65_gpu)
                 _WNAF_LAST_USED = False
         else:
             if secp_gpu_batch is not None:
-                pub65_gpu = secp_gpu_batch(sk_gpu)
+                pub65_gpu = secp_gpu_batch(sk_gpu, out=pub65_gpu)
             else:
-                pub65_gpu = gpu_secp256k1_batch(sk_gpu)
-            _WNAF_LAST_USED = False
+                pub65_gpu = gpu_secp256k1_batch(sk_gpu, out=pub65_gpu)
 
         xy_gpu = pub65_gpu[:, 1:]
-        addr20_gpu = gpu_keccak256_batch(xy_gpu, address_only=True)
-        prefix_tron_gpu = cp.full((cur, 1), 0x41, dtype=cp.uint8)
-        tron21_gpu = cp.concatenate([prefix_tron_gpu, addr20_gpu], axis=1)
+        tron21_gpu, tron_owner = _acquire_gpu_array(cur, 21, cp.uint8)
+        buffer_map["tron21"] = tron_owner
+        tron21_gpu[:, 0] = 0x41
+        addr_slice = tron21_gpu[:, 1:]
+        gpu_keccak256_batch(xy_gpu, address_only=True, out=addr_slice)
 
-        try:
-            ascii_gpu, lens_gpu = _gpu_base58check_raw(tron21_gpu)
+        if suffix_mod_params is not None and suf_len > 0:
+            target_val, mod_base = suffix_mod_params
+            hits_idx = _suffix_mod_filter(tron21_gpu, target_val, mod_base)
+
+        if suffix_mod_params is None or (hits_idx is not None and hits_idx.size == 0):
+            ascii_buf, ascii_owner = _acquire_gpu_array(cur, 60, cp.uint8)
+            buffer_map["ascii"] = ascii_owner
+            ascii_buf.fill(0)
+            lens_buf, lens_owner = _acquire_gpu_array(cur, None, cp.int32)
+            buffer_map["lens"] = lens_owner
+            lens_buf.fill(0)
+
+            ascii_gpu, lens_gpu = _gpu_base58check_raw(tron21_gpu, ascii_buf, lens_buf)
+            if buffer_map.get("ascii") is not None and ascii_gpu.base is not buffer_map["ascii"]:
+                _release_gpu_array(buffer_map.pop("ascii"))
+            if buffer_map.get("lens") is not None and lens_gpu.base is not buffer_map["lens"]:
+                _release_gpu_array(buffer_map.pop("lens"))
+
             mask: Optional["cp.ndarray"] = None
             if pref_len > 0 and prefix_gpu is not None:
-                prefix_mask = lens_gpu >= pref_len
-                head = ascii_gpu[:, :pref_len]
-                head_cmp = cp.all(head == prefix_gpu[None, :], axis=1)
-                mask = cp.logical_and(prefix_mask, head_cmp)
+                try:
+                    prefix_mask_buf, prefix_owner = _acquire_gpu_array(cur, None, cp.uint8)
+                    try:
+                        threads_prefix = _BASE58_THREADS
+                        blocks_prefix = (cur + threads_prefix - 1) // threads_prefix
+                        _prefix_filter_kernel(
+                            (blocks_prefix,),
+                            (threads_prefix,),
+                            (
+                                ascii_gpu,
+                                lens_gpu,
+                                prefix_gpu,
+                                cp.int32(pref_len),
+                                cp.int32(ascii_gpu.shape[1]),
+                                cp.int32(cur),
+                                prefix_mask_buf,
+                            ),
+                        )
+                        prefix_match = prefix_mask_buf.view(cp.bool_)
+                        mask = prefix_match if mask is None else cp.logical_and(mask, prefix_match)
+                    finally:
+                        _release_gpu_array(prefix_owner)
+                except Exception:
+                    prefix_mask = lens_gpu >= pref_len
+                    head = ascii_gpu[:, :pref_len]
+                    head_cmp = cp.all(head == prefix_gpu[None, :], axis=1)
+                    prefix_match = cp.logical_and(prefix_mask, head_cmp)
+                    mask = prefix_match if mask is None else cp.logical_and(mask, prefix_match)
             if suf_len > 0 and suffix_gpu is not None:
                 suffix_mask = lens_gpu >= suf_len
                 idx = cp.arange(suf_len, dtype=cp.int32)[None, :]
@@ -794,9 +1126,26 @@ def _launch_batch(
                 hits_idx = cp.nonzero(mask)[0]
             elif pref_len == 0 and suf_len == 0:
                 hits_idx = cp.arange(cur, dtype=cp.int64)
-        except Exception:
-            fallback_cpu = True
-            tron21_gpu = tron21_gpu.copy()
+        else:
+            if hits_idx is None:
+                hits_idx = cp.empty((0,), dtype=cp.int64)
+            if hits_idx.size > 0:
+                ascii_buf, ascii_owner = _acquire_gpu_array(cur, 60, cp.uint8)
+                buffer_map["ascii"] = ascii_owner
+                ascii_buf.fill(0)
+                lens_buf, lens_owner = _acquire_gpu_array(cur, None, cp.int32)
+                buffer_map["lens"] = lens_owner
+                lens_buf.fill(0)
+
+                subset = tron21_gpu[hits_idx]
+                ascii_sub, lens_sub = _gpu_base58check_raw(subset)
+                ascii_buf[hits_idx, :] = ascii_sub
+                lens_buf[hits_idx] = lens_sub
+                ascii_gpu = ascii_buf
+                lens_gpu = lens_buf
+            else:
+                ascii_gpu = None
+                lens_gpu = None
 
         event = cp.cuda.Event()
         event.record(stream)
@@ -811,6 +1160,7 @@ def _launch_batch(
         fallback_cpu=fallback_cpu,
         size=cur,
         device_id=device_id,
+        buffer_owners=buffer_map,
     )
 
 
@@ -825,58 +1175,80 @@ def _process_context_cpu_sync(
     priv_local: List[bytes] = []
     with cp.cuda.Device(ctx.device_id):
         ctx.event.synchronize()
-
-        if ctx.fallback_cpu or ctx.ascii_gpu is None or ctx.lens_gpu is None:
-            tron21_cpu = cp.asnumpy(ctx.tron21_gpu)
-            priv_cpu = cp.asnumpy(ctx.sk_gpu)
-            for i in range(ctx.size):
-                body = tron21_cpu[i].tobytes()
-                checksum = _sha256d(body)[:4]
-                addr_b58 = base58.b58encode(body + checksum).decode()
-                if prefix_bytes is not None and not addr_b58.startswith(prefix_str or ""):
-                    continue
-                if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
-                    continue
-                results_local.append((body.hex(), addr_b58))
-                priv_local.append(priv_cpu[i].tobytes())
-        elif prefix_bytes is not None or suffix_bytes is not None:
-            hits_idx = ctx.hits_idx
-            if hits_idx is not None and hits_idx.size > 0:
-                hits_cpu = cp.asnumpy(hits_idx)
-                if hits_cpu.size > 0:
-                    tron21_hits = cp.asnumpy(ctx.tron21_gpu[hits_cpu])
-                    ascii_hits = cp.asnumpy(ctx.ascii_gpu[hits_cpu])
-                    lens_hits = cp.asnumpy(ctx.lens_gpu[hits_cpu])
-                    priv_hits = cp.asnumpy(ctx.sk_gpu[hits_cpu])
-                    for i in range(tron21_hits.shape[0]):
-                        addr_hex = tron21_hits[i].tobytes().hex()
-                        ln = int(lens_hits[i])
-                        addr_b58 = ascii_hits[i, :ln].tobytes().decode()
+        try:
+            if ctx.fallback_cpu or ctx.ascii_gpu is None or ctx.lens_gpu is None:
+                hits_idx = ctx.hits_idx
+                if hits_idx is not None:
+                    hits_cpu = cp.asnumpy(hits_idx)
+                    if hits_cpu.size == 0:
+                        return results_local, priv_local
+                    tron21_sel = cp.asnumpy(ctx.tron21_gpu[hits_cpu])
+                    priv_sel = cp.asnumpy(ctx.sk_gpu[hits_cpu])
+                    for body_arr, priv_arr in zip(tron21_sel, priv_sel):
+                        body = body_arr.tobytes()
+                        checksum = _sha256d(body)[:4]
+                        addr_b58 = base58.b58encode(body + checksum).decode()
                         if prefix_bytes is not None and not addr_b58.startswith(prefix_str or ""):
                             continue
                         if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
                             continue
-                        results_local.append((addr_hex, addr_b58))
-                        priv_local.append(priv_hits[i].tobytes())
-        else:
-            tron21_cpu = cp.asnumpy(ctx.tron21_gpu)
-            ascii_cpu = cp.asnumpy(ctx.ascii_gpu)
-            lens_cpu = cp.asnumpy(ctx.lens_gpu)
-            priv_cpu = cp.asnumpy(ctx.sk_gpu)
-            for i in range(ctx.size):
-                addr_hex = tron21_cpu[i].tobytes().hex()
-                ln = int(lens_cpu[i])
-                addr_b58 = ascii_cpu[i, :ln].tobytes().decode()
-                if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
-                    continue
-                results_local.append((addr_hex, addr_b58))
-                priv_local.append(priv_cpu[i].tobytes())
-
-    ctx.ascii_gpu = None
-    ctx.lens_gpu = None
-    ctx.tron21_gpu = None
-    ctx.sk_gpu = None
-    ctx.hits_idx = None
+                        results_local.append((body.hex(), addr_b58))
+                        priv_local.append(priv_arr.tobytes())
+                else:
+                    tron21_cpu = cp.asnumpy(ctx.tron21_gpu)
+                    priv_cpu = cp.asnumpy(ctx.sk_gpu)
+                    for i in range(ctx.size):
+                        body = tron21_cpu[i].tobytes()
+                        checksum = _sha256d(body)[:4]
+                        addr_b58 = base58.b58encode(body + checksum).decode()
+                        if prefix_bytes is not None and not addr_b58.startswith(prefix_str or ""):
+                            continue
+                        if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
+                            continue
+                        results_local.append((body.hex(), addr_b58))
+                        priv_local.append(priv_cpu[i].tobytes())
+            elif prefix_bytes is not None or suffix_bytes is not None:
+                hits_idx = ctx.hits_idx
+                if hits_idx is not None and hits_idx.size > 0:
+                    hits_cpu = cp.asnumpy(hits_idx)
+                    if hits_cpu.size > 0:
+                        tron21_hits = cp.asnumpy(ctx.tron21_gpu[hits_cpu])
+                        ascii_hits = cp.asnumpy(ctx.ascii_gpu[hits_cpu])
+                        lens_hits = cp.asnumpy(ctx.lens_gpu[hits_cpu])
+                        priv_hits = cp.asnumpy(ctx.sk_gpu[hits_cpu])
+                        for i in range(tron21_hits.shape[0]):
+                            addr_hex = tron21_hits[i].tobytes().hex()
+                            ln = int(lens_hits[i])
+                            addr_b58 = ascii_hits[i, :ln].tobytes().decode()
+                            if prefix_bytes is not None and not addr_b58.startswith(prefix_str or ""):
+                                continue
+                            if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
+                                continue
+                            results_local.append((addr_hex, addr_b58))
+                            priv_local.append(priv_hits[i].tobytes())
+            else:
+                tron21_cpu = cp.asnumpy(ctx.tron21_gpu)
+                ascii_cpu = cp.asnumpy(ctx.ascii_gpu)
+                lens_cpu = cp.asnumpy(ctx.lens_gpu)
+                priv_cpu = cp.asnumpy(ctx.sk_gpu)
+                index_iter = range(ctx.size)
+                if ctx.hits_idx is not None and ctx.hits_idx.size > 0:
+                    index_iter = cp.asnumpy(ctx.hits_idx).tolist()
+                for i in index_iter:
+                    addr_hex = tron21_cpu[i].tobytes().hex()
+                    ln = int(lens_cpu[i])
+                    addr_b58 = ascii_cpu[i, :ln].tobytes().decode()
+                    if suffix_bytes is not None and not addr_b58.endswith(suffix_str or ""):
+                        continue
+                    results_local.append((addr_hex, addr_b58))
+                    priv_local.append(priv_cpu[i].tobytes())
+        finally:
+            _release_context_buffers(ctx)
+            ctx.ascii_gpu = None
+            ctx.lens_gpu = None
+            ctx.tron21_gpu = None
+            ctx.sk_gpu = None
+            ctx.hits_idx = None
     return results_local, priv_local
 
 
@@ -898,14 +1270,21 @@ def _extend_results(
     results: List[Tuple[str, str]],
     privkeys_out: List[bytes],
     max_hits: Optional[int],
-) -> bool:
+) -> Tuple[bool, int]:
     limit = max_hits if max_hits is not None else None
+    hits_added = 0
+    done = False
     for pair, priv in zip(pairs, privs):
         if limit is not None and len(results) >= limit:
-            return True
+            done = True
+            break
         results.append(pair)
         privkeys_out.append(priv)
-    return limit is not None and len(results) >= limit
+        hits_added += 1
+        if limit is not None and len(results) >= limit:
+            done = True
+            break
+    return done, hits_added
 
 
 def _handle_completed_context(
@@ -917,7 +1296,7 @@ def _handle_completed_context(
     results: List[Tuple[str, str]],
     privkeys_out: List[bytes],
     max_hits: Optional[int],
-) -> bool:
+) -> Tuple[bool, int]:
     try:
         pairs, privs = (
             ctx.cpu_future.result()
@@ -928,7 +1307,8 @@ def _handle_completed_context(
         pairs, privs = _process_context_cpu_sync(ctx, prefix_bytes, prefix_str, suffix_bytes, suffix_str)
     finally:
         ctx.cpu_future = None
-    return _extend_results(pairs, privs, results, privkeys_out, max_hits)
+    done, hits_added = _extend_results(pairs, privs, results, privkeys_out, max_hits)
+    return done, hits_added
 
 
 def _drain_ready_contexts(
@@ -940,14 +1320,17 @@ def _drain_ready_contexts(
     suffix_bytes: Optional[bytes],
     suffix_str: Optional[str],
     max_hits: Optional[int],
-) -> bool:
+) -> Tuple[bool, int, int]:
     done = False
+    hits_total = 0
+    processed = 0
     while pending:
         future = pending[0].cpu_future
         if future is None or not future.done():
             break
         ctx = pending.pop(0)
-        if _handle_completed_context(
+        processed += 1
+        done_flag, hits_added = _handle_completed_context(
             ctx,
             prefix_bytes,
             prefix_str,
@@ -956,10 +1339,12 @@ def _drain_ready_contexts(
             results,
             privkeys_out,
             max_hits,
-        ):
+        )
+        hits_total += hits_added
+        if done_flag:
             done = True
             break
-    return done
+    return done, hits_total, processed
 
 
 def generate_tron_addresses_gpu(
@@ -971,7 +1356,8 @@ def generate_tron_addresses_gpu(
     *,
     dynamic_batches: Optional[Sequence[int]] = None,
     stream_count: Optional[int] = None,
-) -> Tuple[List[Tuple[str, str]], List[bytes]]:
+    return_stats: bool = False,
+) -> Union[Tuple[List[Tuple[str, str]], List[bytes]], Tuple[List[Tuple[str, str]], List[bytes], Dict[str, Union[int, float, bool]]]]:
     """
     完全在 GPU 記憶體流程的雛形（保留 CPU 後備），回傳 (地址列表, 私鑰列表)：
     - 地址列表：[(hex_addr, base58_addr), ...]
@@ -987,6 +1373,12 @@ def generate_tron_addresses_gpu(
 
     results: List[Tuple[str, str]] = []
     privkeys_out: List[bytes] = []
+    batches_executed = 0
+    launch_time_total = 0.0
+    wnaf_used_any = False
+    start_time_total = time.perf_counter()
+
+    global _WNAF_ADAPTIVE_LIMIT
 
     logger.info(
         "[WNAF] generate_tron_addresses_gpu 呼叫：ready=%s broken=%s default=%s",
@@ -1021,6 +1413,14 @@ def generate_tron_addresses_gpu(
         else:
             suffix_bytes = None
 
+    suffix_mod_params: Optional[Tuple[int, int]] = None
+    if suf_len > 0 and suffix_bytes is not None:
+        try:
+            suffix_mod_params = _compute_suffix_mod_params(suffix_bytes)
+        except ValueError as exc:
+            logger.debug("suffix 模運算不可用：%s", exc)
+            suffix_mod_params = None
+
     processed = 0
     done = False
 
@@ -1050,24 +1450,41 @@ def generate_tron_addresses_gpu(
     stream_idx = 0
 
     use_wnaf_kernel = _USE_WNAF_DEFAULT
-    wnaf_threshold = max(0, _WNAF_BATCH_THRESHOLD)
     if use_wnaf_kernel:
         logger.info("[WNAF] 預設啟用 Window4 核心，等待預熱完成")
     else:
         logger.info("[WNAF] 已停用 Window4 核心，改用標準 secp256k1 內核")
     if use_wnaf_kernel:
-        logger.info("[WNAF] 自動切換門檻：批次 > %d 將改用標準內核", _WNAF_BATCH_THRESHOLD)
+        if _WNAF_ADAPTIVE_LIMIT > 0:
+            logger.info("[WNAF] 初始門檻：批次 > %d 將改用標準內核", _WNAF_ADAPTIVE_LIMIT)
+        else:
+            logger.info("[WNAF] 未設定門檻，將嘗試所有批次使用 Window4")
     async_loop = _ensure_async_loop()
-    max_pending = max(stream_count, 1) * _MAX_PENDING_MULTIPLIER_DEFAULT
+    base_pending_limit = max(stream_count, 1) * _MAX_PENDING_MULTIPLIER_DEFAULT
+    pending_limit = base_pending_limit
+    pending_block_events = 0
+    pending_relax_events = 0
+    next_batch = batch_plan[0]
+    max_batch_plan = batch_plan[-1]
+    no_hit_streak = 0
 
     while processed < count and not done:
         remain = count - processed
-        cur = _select_batch_size(remain, batch_plan, stream_count)
+        desired = min(next_batch, remain)
+        if desired < batch_plan[0]:
+            desired = batch_plan[0] if remain >= batch_plan[0] else remain
+        desired = max(1, int(desired))
+        plan_with_desired = sorted(set(batch_plan + [desired]))
+        cur = _select_batch_size(remain, plan_with_desired, stream_count)
+        cur = min(cur, remain)
+        cur = max(1, cur)
         processed += cur
 
         stream = streams[stream_idx % stream_count]
         stream_idx += 1
-        use_wnaf_this_batch = use_wnaf_kernel and (wnaf_threshold == 0 or cur <= wnaf_threshold)
+        adaptive_limit = _WNAF_ADAPTIVE_LIMIT
+        use_wnaf_this_batch = use_wnaf_kernel and (adaptive_limit <= 0 or cur <= adaptive_limit)
+        launch_start = time.perf_counter()
         ctx = _launch_batch(
             cur,
             stream,
@@ -1076,13 +1493,22 @@ def generate_tron_addresses_gpu(
             suffix_gpu,
             suf_len,
             use_wnaf_this_batch,
+            suffix_mod_params,
         )
+        launch_time_total += time.perf_counter() - launch_start
+        batches_executed += 1
+        wnaf_used_any = wnaf_used_any or _WNAF_LAST_USED
         ctx.cpu_future = asyncio.run_coroutine_threadsafe(
             _process_context_async(ctx, prefix_bytes, prefix_str, suffix_bytes, suffix_str), async_loop
         )
         pending.append(ctx)
 
-        if _drain_ready_contexts(
+        if len(pending) >= pending_limit:
+            pending_block_events += 1
+        else:
+            pending_block_events = max(0, pending_block_events - 1)
+
+        drain_done, hits_added, processed_ctx = _drain_ready_contexts(
             pending,
             results,
             privkeys_out,
@@ -1091,13 +1517,30 @@ def generate_tron_addresses_gpu(
             suffix_bytes,
             suffix_str,
             max_hits,
-        ):
+        )
+        if processed_ctx:
+            if hits_added == 0:
+                no_hit_streak += processed_ctx
+                if no_hit_streak >= max(3, stream_count):
+                    desired_growth = min(max_batch_plan, int(next_batch * 1.5))
+                    next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
+                    if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
+                        _WNAF_ADAPTIVE_LIMIT = next_batch
+                        logger.info("[WNAF] 自適應門檻提升至 %d (探索較大批次)", _WNAF_ADAPTIVE_LIMIT)
+                    no_hit_streak = 0
+            else:
+                no_hit_streak = 0
+                next_batch = batch_plan[0]
+        if drain_done:
             done = True
             break
 
-        if len(pending) >= max_pending:
+        if len(pending) >= pending_limit:
+            if pending_block_events >= 8 and pending_limit < stream_count * 8:
+                pending_limit += stream_count
+                pending_block_events = 0
             ctx_wait = pending.pop(0)
-            if _handle_completed_context(
+            wait_done, hits_added_wait = _handle_completed_context(
                 ctx_wait,
                 prefix_bytes,
                 prefix_str,
@@ -1106,9 +1549,30 @@ def generate_tron_addresses_gpu(
                 results,
                 privkeys_out,
                 max_hits,
-            ):
+            )
+            if hits_added_wait > 0:
+                no_hit_streak = 0
+                next_batch = batch_plan[0]
+            else:
+                no_hit_streak += 1
+                if no_hit_streak >= max(3, stream_count):
+                    desired_growth = min(max_batch_plan, int(next_batch * 1.5))
+                    next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
+                    if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
+                        _WNAF_ADAPTIVE_LIMIT = next_batch
+                        logger.info("[WNAF] 自適應門檻提升至 %d (pending flush)", _WNAF_ADAPTIVE_LIMIT)
+                    no_hit_streak = 0
+            if wait_done:
                 done = True
                 break
+        else:
+            if len(pending) <= stream_count and pending_limit > base_pending_limit:
+                pending_relax_events += 1
+                if pending_relax_events >= 16:
+                    pending_limit = max(base_pending_limit, pending_limit - stream_count)
+                    pending_relax_events = 0
+            else:
+                pending_relax_events = 0
 
         if max_hits is not None and len(results) >= max_hits:
             done = True
@@ -1116,7 +1580,7 @@ def generate_tron_addresses_gpu(
 
     while pending and not done:
         ctx = pending.pop(0)
-        if _handle_completed_context(
+        done_flag_rest, hits_added_rest = _handle_completed_context(
             ctx,
             prefix_bytes,
             prefix_str,
@@ -1125,10 +1589,43 @@ def generate_tron_addresses_gpu(
             results,
             privkeys_out,
             max_hits,
-        ):
+        )
+        if hits_added_rest > 0:
+            no_hit_streak = 0
+            next_batch = batch_plan[0]
+        else:
+            no_hit_streak += 1
+            if no_hit_streak >= max(3, stream_count):
+                desired_growth = min(max_batch_plan, int(next_batch * 1.5))
+                next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
+                if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
+                    _WNAF_ADAPTIVE_LIMIT = next_batch
+                    logger.info("[WNAF] 自適應門檻提升至 %d (flush)", _WNAF_ADAPTIVE_LIMIT)
+                no_hit_streak = 0
+        if done_flag_rest:
             done = True
             break
 
+    total_elapsed = time.perf_counter() - start_time_total
+    if return_stats:
+        stats = {
+            "requested": count,
+            "processed": processed,
+            "batches": batches_executed,
+            "elapsed_sec": total_elapsed,
+            "launch_sec": launch_time_total,
+            "wnaf_used": wnaf_used_any,
+            "wnaf_limit": _WNAF_ADAPTIVE_LIMIT,
+            "wnaf_base": _WNAF_BASE_THRESHOLD,
+            "wnaf_last_used": _WNAF_LAST_USED,
+            "pending_limit": pending_limit,
+            "pending_base": base_pending_limit,
+            "next_batch": next_batch,
+            "streams": stream_count,
+            "max_plan": max_batch_plan,
+            "last_batch_size": locals().get("cur", 0),
+        }
+        return results, privkeys_out, stats
     return results, privkeys_out
 
 

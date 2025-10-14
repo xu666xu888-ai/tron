@@ -7,12 +7,12 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .addr import privkey_to_tron_address
 from .hardware_config import HardwareAdaptiveConfig
 
-ProgressCallback = Callable[[int, int, int, float], None]
+ProgressCallback = Callable[[int, int, int, float, Optional[Dict[str, float]]], None]
 
 
 @dataclass(frozen=True)
@@ -110,8 +110,21 @@ class VanitySearchEngine:
 
         dynamic_batches = self._config.default_batches or (16384,)
         stream_count = max(2, self._config.default_streams)
-        batch_size = dynamic_batches[0] if dynamic_batches else 16384
-        batch_size = min(max(batch_size, 8192), self._config.max_batch_size or batch_size)
+        max_cap = self._config.max_batch_size or 0
+        if dynamic_batches:
+            if max_cap > 0:
+                eligible = [b for b in dynamic_batches if b <= max_cap]
+                if eligible:
+                    batch_size = eligible[-1]
+                else:
+                    batch_size = max_cap
+            else:
+                batch_size = dynamic_batches[-1]
+        else:
+            batch_size = max_cap if max_cap > 0 else 16384
+        batch_size = max(8192, batch_size)
+        if max_cap > 0:
+            batch_size = min(batch_size, max_cap)
 
         attempts = 0
         hits_total = 0
@@ -137,19 +150,25 @@ class VanitySearchEngine:
             current_count = max(1, min(current_count, self._config.max_batch_size or current_count))
 
             batch_begin = time.time()
-            addresses, privs = generate_tron_addresses_gpu(
+            addresses, privs, gpu_stats = generate_tron_addresses_gpu(
                 count=current_count,
                 batch_size=current_count,
                 suffix=suffix,
                 max_hits=1,
                 dynamic_batches=dynamic_batches,
                 stream_count=stream_count,
+                return_stats=True,
             )
             batch_elapsed = time.time() - batch_begin
             attempts += current_count
             hits_total += len(addresses)
             if progress_callback is not None:
-                progress_callback(attempts, hits_total, current_count, max(batch_elapsed, 1e-6))
+                gpu_metrics = {
+                    "batch_time": batch_elapsed,
+                    "streams": stream_count,
+                    **(gpu_stats or {}),
+                }
+                progress_callback(attempts, hits_total, current_count, max(batch_elapsed, 1e-6), gpu_metrics)
 
             if addresses:
                 hits = [
@@ -221,7 +240,7 @@ class VanitySearchEngine:
 
             batch_elapsed = time.time() - batch_begin
             if progress_callback is not None:
-                progress_callback(attempts, hits_total, processed, max(batch_elapsed, 1e-6))
+                progress_callback(attempts, hits_total, processed, max(batch_elapsed, 1e-6), None)
 
             if hit is not None:
                 return [hit], attempts, "found"
@@ -234,4 +253,3 @@ __all__ = [
     "SearchResult",
     "VanitySearchEngine",
 ]
-

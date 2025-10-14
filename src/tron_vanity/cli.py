@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, List
@@ -29,6 +30,13 @@ DEFAULT_CONFIG_LOCATIONS = (
     Path.home() / ".tron_vanity_cli.json",
 )
 HISTORY_PATH = Path.home() / ".tron_vanity_history.jsonl"
+SESSION_POLL_INTERVAL = 0.5
+
+
+class StopRequested(Exception):
+    """背景任務收到停止指令時拋出的例外。"""
+
+    pass
 
 CONFIG_KEYS = (
     "suffix",
@@ -53,13 +61,24 @@ from .performance_estimator import (
 )
 from .system_info import SystemInfo, collect_system_info
 from .monitor import VanitySearchMonitor
-from .search_engine import SearchResult, VanitySearchEngine
+from .search_engine import SearchHit, SearchResult, VanitySearchEngine
 from .ui_components import (
     ascii_logo,
     build_dependency_table,
     build_difficulty_panel,
     build_manual_actions_panel,
     build_system_summary,
+)
+from .session_manager import (
+    clear_session,
+    get_log_file,
+    get_session_file,
+    initialize_session,
+    is_session_active,
+    load_session,
+    record_pid,
+    request_stop,
+    update_session,
 )
 
 Console = None
@@ -496,7 +515,12 @@ def _save_cli_config(
 
 def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TRON 靚號地址生成 CLI")
-    parser.add_argument("--suffix", type=str, help="直接指定欲搜尋的 Base58 尾碼（例如 88888）")
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="6666",
+        help="直接指定欲搜尋的 Base58 尾碼（例如 88888）",
+    )
     parser.add_argument("--timeout", type=float, help="設定搜尋逾時秒數")
     parser.add_argument("--max-attempts", type=int, help="限制最多嘗試次數")
     parser.add_argument("--cpu-only", action="store_true", help="強制使用 CPU 模式搜尋")
@@ -524,13 +548,334 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         const="",
         help="將目前參數存成配置檔；若未提供路徑，預設寫入 ~/.tron_vanity_cli.json",
     )
+    parser.add_argument("--attach", action="store_true", help="連接背景搜尋任務的即時狀態")
+    parser.add_argument("--stop", action="store_true", help="要求目前的背景搜尋任務停止")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--session-file", type=str, help=argparse.SUPPRESS)
     return parser.parse_args([] if argv is None else list(argv))
+
+
+def _start_background_worker(session_path: Path) -> int:
+    """啟動背景工作進程，並將輸出寫入共用日誌。"""
+
+    cmd = [sys.executable, "-m", "tron_vanity", "--worker", "--session-file", str(session_path)]
+    env = os.environ.copy()
+    log_file = get_log_file()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    state = load_session(session_path) or {}
+    suffix = state.get("task", {}).get("suffix", "-")
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        log_handle.write(f"[{timestamp}] launch worker for suffix={suffix}\n")
+        log_handle.flush()
+        proc = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            env=env,
+        )
+    return proc.pid
+
+
+def _stop_session(console: "Console") -> int:
+    session_path = get_session_file()
+    state = load_session(session_path)
+    if not state or not state.get("pid"):
+        console.print("[yellow]目前沒有背景搜尋任務。[/yellow]")
+        clear_session(session_path)
+        return 0
+    if not is_session_active(session_path):
+        console.print("[yellow]背景搜尋任務已結束。[/yellow]")
+        clear_session(session_path)
+        return 0
+    request_stop(session_path)
+    console.print("[cyan]已送出停止請求，可稍後使用 --attach 查看狀態。[/cyan]")
+    return 0
+
+
+def _build_search_result_from_state(state: dict) -> Optional[SearchResult]:
+    result_data = state.get("result") or {}
+    if not result_data:
+        return None
+    hits_raw = result_data.get("hits") or []
+    hits = [
+        SearchHit(
+            address_hex=item.get("address_hex", ""),
+            address_base58=item.get("address_base58", ""),
+            privkey_hex=item.get("privkey_hex", ""),
+        )
+        for item in hits_raw
+    ]
+    return SearchResult(
+        found=bool(result_data.get("found", False)),
+        backend=result_data.get("backend", "GPU"),
+        attempts=int(result_data.get("attempts", state.get("checked", 0))),
+        elapsed=float(result_data.get("elapsed", state.get("elapsed_total", 0.0))),
+        hits=hits,
+        reason=result_data.get("reason", "found"),
+    )
+
+
+def _present_session_result(console: "Console", state: dict) -> None:
+    task = state.get("task", {})
+    suffix = task.get("suffix", "-")
+    status = state.get("status", "unknown")
+    console.rule("搜尋結果")
+
+    if status == "completed":
+        result = _build_search_result_from_state(state)
+        if result and result.found and result.hits:
+            summary = (
+                f"[bold green]命中靚號！[/bold green]\n"
+                f"後端：{result.backend}\n"
+                f"耗時：{result.elapsed:.2f} 秒\n"
+                f"嘗試次數：約 {result.attempts:,} 次\n"
+                f"Base58 地址：{result.hits[0].address_base58}\n"
+                f"HEX 地址：{result.hits[0].address_hex}\n"
+                f"私鑰 (HEX)：{result.hits[0].privkey_hex}"
+            )
+            console.print(Panel(summary, border_style="green", title="成功"))
+            system_info_obj = collect_system_info()
+            hw_config_obj = detect_hardware_config(force_cpu=bool(task.get("cpu_only")))
+            output_path = _save_result(result, suffix, task.get("output"), system_info_obj, hw_config_obj)
+            if output_path:
+                console.print(f"[green]已將結果寫入：{output_path}[/green]")
+            recap_preset = task.get("preset") or task.get("save_preset")
+            config_path_str = task.get("config_path")
+            config_path_obj = Path(config_path_str).expanduser() if config_path_str else None
+            save_preset_name = task.get("save_preset")
+            set_default = task.get("set_default_preset")
+            config_data = task.get("config_data") or {}
+            args_settings = task.get("args_settings") or {}
+            if save_preset_name and config_data and args_settings:
+                args_namespace = argparse.Namespace(**args_settings)
+                preset_path = _save_cli_config(
+                    config_data,
+                    config_path_str,
+                    args_namespace,
+                    preset=save_preset_name,
+                    set_default=(set_default == save_preset_name),
+                )
+                console.print(f"[green]已更新預設設定：{save_preset_name}（檔案：{preset_path}）[/green]")
+                if set_default == save_preset_name:
+                    console.print(f"[cyan]已同步將 {save_preset_name} 設為預設設定。[/cyan]")
+                config_path_obj = preset_path
+                recap_preset = save_preset_name
+            _record_history(suffix, result, recap_preset, config_path_obj, output_path)
+        else:
+            reason_map = {
+                "timeout": "已達設定的逾時限制",
+                "max_attempts": "已達最大嘗試次數限制",
+                "found": "搜尋完成",
+            }
+            reason_text = reason_map.get(result.reason if result else "", "未命中")
+            attempts_val = result.attempts if result else int(state.get("checked", 0))
+            elapsed_val = result.elapsed if result else float(state.get("elapsed_total", 0.0))
+            console.print(
+                Panel(
+                    f"[yellow]未命中靚號。[/yellow]\n"
+                    f"原因：{reason_text}\n"
+                    f"耗時：{elapsed_val:.2f} 秒\n"
+                    f"嘗試次數：約 {attempts_val:,} 次",
+                    border_style="yellow",
+                    title="未命中",
+                )
+            )
+            if result:
+                _record_history(suffix, result, task.get("preset"), None, None)
+    elif status == "stopped":
+        console.print("[yellow]背景搜尋已依要求停止。[/yellow]")
+    elif status == "error":
+        console.print(f"[red]背景搜尋發生錯誤：{state.get('error_message', '未知錯誤')}[/red]")
+        console.print(f"[yellow]請檢視日誌：{get_log_file()}[/yellow]")
+    else:
+        console.print(f"[yellow]背景搜尋已結束，狀態：{status}[/yellow]")
+
+
+def _attach_session(console: "Console") -> int:
+    session_path = get_session_file()
+    state = load_session(session_path)
+    if not state:
+        console.print("[yellow]目前沒有背景搜尋任務。[/yellow]")
+        return 0
+    task = state.get("task", {})
+    suffix = task.get("suffix", "-")
+    monitor = VanitySearchMonitor(console, suffix)
+    monitor.start()
+    last_state = state
+    try:
+        while True:
+            state = load_session(session_path)
+            if not state:
+                break
+            if state.get("start_time"):
+                monitor.set_start_time(state["start_time"])
+            metrics = state.get("metrics") or {}
+            last_batch = state.get("last_batch", metrics.get("current_batch", 0))
+            elapsed = metrics.get("batch_time", state.get("batch_time", 1.0))
+            if not elapsed:
+                elapsed = 1e-6
+            monitor.update(
+                checked=int(state.get("checked", 0)),
+                hits=int(state.get("hits", 0)),
+                last_batch=int(last_batch),
+                elapsed=float(elapsed),
+                metrics=metrics,
+            )
+            last_state = state
+            status = state.get("status", "running")
+            if status in {"completed", "stopped", "error", "timeout", "max_attempts"}:
+                break
+            time.sleep(SESSION_POLL_INTERVAL)
+    except KeyboardInterrupt:
+        monitor.stop()
+        console.print("\n[yellow]已離開即時監控，背景任務仍持續執行。[/yellow]")
+        return 130
+    finally:
+        monitor.stop()
+
+    if last_state:
+        _present_session_result(console, last_state)
+    else:
+        console.print("[yellow]背景任務狀態無法讀取。[/yellow]")
+    clear_session(session_path)
+    return 0
+
+
+def _worker_main(args: argparse.Namespace) -> int:
+    session_path = Path(args.session_file) if args.session_file else get_session_file()
+    state = load_session(session_path)
+    if not state:
+        print("[worker] session file not found")
+        return 1
+    task = state.get("task", {})
+    suffix = task.get("suffix")
+    if not suffix:
+        print("[worker] suffix missing")
+        return 1
+
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    system_info = collect_system_info()
+    hw_config = detect_hardware_config(force_cpu=bool(task.get("cpu_only")))
+    engine = VanitySearchEngine(hw_config)
+    timeout = task.get("timeout")
+    max_attempts = task.get("max_attempts")
+
+    start_time = time.time()
+
+    def _init_state(data: dict) -> dict:
+        data.setdefault("task", task)
+        data["pid"] = os.getpid()
+        data["status"] = "running"
+        data["start_time"] = start_time
+        data["system_info"] = system_info.as_dict()
+        data["hardware"] = {
+            "backend": hw_config.backend,
+            "profile": hw_config.profile,
+            "default_batches": list(hw_config.default_batches),
+            "max_batch_size": hw_config.max_batch_size,
+        }
+        data.setdefault("metrics", {})
+        data.setdefault("checked", 0)
+        data.setdefault("hits", 0)
+        data.setdefault("last_batch", 0)
+        data.setdefault("batch_time", 0.0)
+        data["elapsed_total"] = 0.0
+        return data
+
+    update_session(_init_state, session_path)
+
+    def _progress(checked: int, hits: int, last_batch: int, elapsed: float, metrics: Optional[Dict[str, float]]) -> None:
+        def _mutate(data: dict) -> dict:
+            data.setdefault("task", task)
+            data["pid"] = os.getpid()
+            data["status"] = "running"
+            data["checked"] = checked
+            data["hits"] = hits
+            data["last_batch"] = last_batch
+            data["batch_time"] = elapsed
+            data["elapsed_total"] = time.time() - start_time
+            data["metrics"] = metrics or {}
+            data["last_update"] = time.time()
+            return data
+
+        updated = update_session(_mutate, session_path)
+        if updated.get("stop_requested"):
+            raise StopRequested()
+
+    try:
+        result = engine.search_suffix(
+            suffix,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            progress_callback=_progress,
+        )
+        hits_payload = [
+            {
+                "address_hex": hit.address_hex,
+                "address_base58": hit.address_base58,
+                "privkey_hex": hit.privkey_hex,
+            }
+            for hit in result.hits
+        ]
+
+        def _complete(data: dict) -> dict:
+            data["status"] = "completed" if result.found else result.reason
+            data["result"] = {
+                "found": result.found,
+                "backend": result.backend,
+                "attempts": result.attempts,
+                "elapsed": result.elapsed,
+                "hits": hits_payload,
+                "reason": result.reason,
+            }
+            data["checked"] = result.attempts
+            data["hits"] = len(result.hits)
+            data["elapsed_total"] = result.elapsed
+            data["stop_requested"] = False
+            data["last_update"] = time.time()
+            return data
+
+        update_session(_complete, session_path)
+    except StopRequested:
+        def _stopped(data: dict) -> dict:
+            data["status"] = "stopped"
+            data["stop_requested"] = False
+            data["last_update"] = time.time()
+            return data
+
+        update_session(_stopped, session_path)
+    except Exception as exc:  # pragma: no cover - 以狀態檔回報錯誤
+        def _error(data: dict) -> dict:
+            data["status"] = "error"
+            data["error_message"] = str(exc)
+            data["stop_requested"] = False
+            data["last_update"] = time.time()
+            return data
+
+        update_session(_error, session_path)
+        raise
+
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI 主流程。"""
 
     args = _parse_args(argv)
+    if args.worker:
+        return _worker_main(args)
+
+    auto_install = not args.no_auto_install
+    console = _prepare_console(allow_auto_install=auto_install)
+
+    if args.attach:
+        return _attach_session(console)
+    if args.stop:
+        return _stop_session(console)
+
     user_flags = {
         "yes_cli": bool(args.yes),
         "no_auto_install_cli": bool(args.no_auto_install),
@@ -538,8 +883,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     config, config_path = _load_cli_config(args.config)
     meta = _apply_config(args, config, user_flags)
-    auto_install = not args.no_auto_install
-    console = _prepare_console(allow_auto_install=auto_install)
     config = _ensure_config_structure(config)
 
     pending_default_preset: Optional[str] = None
@@ -638,113 +981,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.cpu_only and hw_config.backend != "CPU":
         hw_config = detect_hardware_config(force_cpu=True)
-    engine = VanitySearchEngine(hw_config)
 
-    monitor: Optional[VanitySearchMonitor] = None
-    if not args.no_monitor:
-        monitor = VanitySearchMonitor(console, suffix)
+    if is_session_active():
+        console.print("[yellow]偵測到背景搜尋任務正在執行，改為接續顯示。[/yellow]")
+        return _attach_session(console)
 
-    def _progress(checked: int, hits: int, last_batch: int, elapsed: float) -> None:
-        if monitor is not None:
-            monitor.update(checked=checked, hits=hits, last_batch=last_batch, elapsed=elapsed)
-        else:
-            message = (
-                f"[progress]已檢查 {checked:,} 筆，最近速率 {last_batch / max(elapsed, 1e-6):,.0f} addr/s[/progress]"
-            )
-            console.print(message, end="\r")
+    console.print("[cyan]初始設定完畢，背景搜尋即將啟動…[/cyan]")
 
-    console.print("[cyan]初始設定完畢，開始搜尋靚號…[/cyan]")
-    result: Optional[SearchResult] = None
-    output_saved_path: Optional[Path] = None
-    try:
-        if monitor is not None:
-            monitor.start()
-        result = engine.search_suffix(
-            suffix,
-            timeout=args.timeout,
-            max_attempts=args.max_attempts,
-            progress_callback=_progress,
-        )
-    except KeyboardInterrupt:
-        console.print("\n[yellow]使用者中止搜尋。[/yellow]")
-        return 130
-    finally:
-        if monitor is not None:
-            monitor.stop()
-        else:
-            console.print()
+    config_snapshot = json.loads(json.dumps(config))
+    task_payload = {
+        "suffix": suffix,
+        "timeout": args.timeout,
+        "max_attempts": args.max_attempts,
+        "cpu_only": bool(args.cpu_only),
+        "output": args.output,
+        "preset": meta.get("active_preset") or args.preset,
+        "config_path": str(config_path) if config_path else None,
+        "save_preset": args.save_preset,
+        "set_default_preset": pending_default_preset,
+        "config_data": config_snapshot,
+        "args_settings": _collect_settings_from_args(args),
+    }
 
-    console.rule("搜尋結果")
-    if not result:
-        console.print("[red]搜尋流程結束，但未取得結果資訊。[/red]")
-        return 1
-
-    if result.found and result.hits:
-        hit = result.hits[0]
-        summary = (
-            f"[bold green]命中靚號！[/bold green]\n"
-            f"後端：{result.backend}\n"
-            f"耗時：{result.elapsed:.2f} 秒\n"
-            f"嘗試次數：約 {result.attempts:,} 次\n"
-            f"Base58 地址：{hit.address_base58}\n"
-            f"HEX 地址：{hit.address_hex}\n"
-            f"私鑰 (HEX)：{hit.privkey_hex}"
-        )
-        console.print(Panel(summary, border_style="green", title="成功"))
-        console.print("[bold cyan]請妥善保存上述私鑰與地址資訊。[/bold cyan]")
-        output_saved_path = _save_result(result, suffix, args.output, system_info, hw_config)
-        if output_saved_path:
-            console.print(f"[green]已將結果寫入：{output_saved_path}[/green]")
-        recap_preset = meta.get("active_preset") or args.preset or args.save_preset
-        if args.save_preset:
-            preset_path = _save_cli_config(
-                config,
-                args.config,
-                args,
-                preset=args.save_preset,
-                set_default=(pending_default_preset == args.save_preset),
-            )
-            console.print(f"[green]已更新預設設定：{args.save_preset}（檔案：{preset_path}）[/green]")
-            if pending_default_preset == args.save_preset:
-                console.print(f"[cyan]已同步將 {args.save_preset} 設為預設設定。[/cyan]")
-            config_path = preset_path
-            recap_preset = args.save_preset
-        _record_history(suffix, result, recap_preset, config_path, output_saved_path)
+    session_path = get_session_file()
+    clear_session(session_path)
+    initialize_session(task_payload, session_path)
+    pid = _start_background_worker(session_path)
+    record_pid(pid, session_path)
+    console.print(f"[cyan]已啟動背景搜尋任務（PID: {pid}）。[/cyan]")
+    console.print(f"[cyan]背景日誌：{get_log_file()}[/cyan]")
+    if args.no_monitor:
+        console.print("[yellow]背景任務將持續執行，可隨時執行 `python -m tron_vanity --attach` 查看進度。[/yellow]")
         return 0
 
-    reason_map = {
-        "timeout": "已達設定的逾時限制",
-        "max_attempts": "已達最大嘗試次數限制",
-        "found": "搜尋完成",
-    }
-    reason_text = reason_map.get(result.reason, result.reason)
-    console.print(
-        Panel(
-            f"[yellow]未命中靚號。[/yellow]\n"
-            f"原因：{reason_text}\n"
-            f"耗時：{result.elapsed:.2f} 秒\n"
-            f"嘗試次數：約 {result.attempts:,} 次",
-            border_style="yellow",
-            title="未命中",
-        )
-    )
-    console.print("[bold white]可調整尾碼長度或於設定中加入逾時/最大嘗試限制後再試。[/bold white]")
-    recap_preset = meta.get("active_preset") or args.preset or args.save_preset
-    if args.save_preset:
-        preset_path = _save_cli_config(
-            config,
-            args.config,
-            args,
-            preset=args.save_preset,
-            set_default=(pending_default_preset == args.save_preset),
-        )
-        console.print(f"[green]已更新預設設定：{args.save_preset}（檔案：{preset_path}）[/green]")
-        if pending_default_preset == args.save_preset:
-            console.print(f"[cyan]已同步將 {args.save_preset} 設為預設設定。[/cyan]")
-        config_path = preset_path
-        recap_preset = args.save_preset
-    _record_history(suffix, result, recap_preset, config_path, None)
-    return 2
+    return _attach_session(console)
 
 
 def _signal_handler(sig, frame) -> None:

@@ -160,9 +160,9 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
     if profile == "L4":
         return replace(
             base,
-            default_batches=(16384, 32768, 65536, 98304, 131072, 196608, 262144, 327680),
-            default_streams=6,
-            wnaf_threshold=196608,
+            default_batches=(32768, 65536, 131072, 262144, 393216, 524288, 786432, 917504),
+            default_streams=8,
+            wnaf_threshold=32768,
             secp_threads=256,
             keccak_threads=256,
             sha_threads=256,
@@ -204,7 +204,7 @@ def _compute_max_batch(defaults: Tuple[int, ...], total_mem_gb: float, backend: 
     if total_mem_gb <= 0:
         total_mem_gb = 1.0
     if backend == "GPU":
-        factor = 12_000  # 22 GiB -> 約 264k
+        factor = 40_960  # 23 GiB -> 約 940k，可充分利用 L4 VRAM
     else:
         factor = 1_024  # 16 GiB -> 約 16k
     mem_limit = _align(int(total_mem_gb * factor))

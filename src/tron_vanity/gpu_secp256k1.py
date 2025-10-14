@@ -763,7 +763,7 @@ _secp256k1_kernel_w4 = _secp256k1_module_w4.get_function("secp256k1_pubkey_batch
 _LOGGER = logging.getLogger(__name__)
 
 
-def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
+def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray", out: Optional["cp.ndarray"] = None) -> "cp.ndarray":
     """
     在 GPU 上批量計算 secp256k1 公鑰（未壓縮 65 bytes）。
     
@@ -777,7 +777,14 @@ def gpu_secp256k1_batch(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
         raise ValueError("privkeys_gpu 需為 uint8 (N,32)")
     
     n = privkeys_gpu.shape[0]
-    pubkeys_gpu = cp.zeros((n, 65), dtype=cp.uint8)
+    if out is None:
+        pubkeys_gpu = cp.empty((n, 65), dtype=cp.uint8)
+    else:
+        if out.dtype != cp.uint8 or out.ndim != 2 or out.shape[0] != n or out.shape[1] != 65:
+            raise ValueError("out 需為 uint8 (N,65)")
+        if out.strides[1] != 1:
+            raise ValueError("out 必須為連續記憶體陣列")
+        pubkeys_gpu = out
     
     threads = _SECP_THREADS
     blocks = (n + threads - 1) // threads
@@ -850,14 +857,21 @@ def warmup_window4_table(force: bool = False) -> None:
     _ensure_precomp_table_w4()
 
 
-def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray") -> "cp.ndarray":
+def gpu_secp256k1_batch_window4(privkeys_gpu: "cp.ndarray", out: Optional["cp.ndarray"] = None) -> "cp.ndarray":
     """實驗性：4-bit 視窗的 GPU 標量乘法。
     已輸出未壓縮公鑰；與主內核一致。若發生錯誤會回退至主內核實作。
     """
     if privkeys_gpu.dtype != cp.uint8 or privkeys_gpu.ndim != 2 or privkeys_gpu.shape[1] != 32:
         raise ValueError("privkeys_gpu 需為 uint8 (N,32)")
     n = privkeys_gpu.shape[0]
-    pub = cp.zeros((n,65), dtype=cp.uint8)
+    if out is None:
+        pub = cp.empty((n, 65), dtype=cp.uint8)
+    else:
+        if out.dtype != cp.uint8 or out.ndim != 2 or out.shape[0] != n or out.shape[1] != 65:
+            raise ValueError("out 需為 uint8 (N,65)")
+        if out.strides[1] != 1:
+            raise ValueError("out 必須為連續記憶體陣列")
+        pub = out
     try:
         _ensure_precomp_table_w4()
         threads = _SECP_THREADS

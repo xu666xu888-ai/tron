@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Optional
+from typing import Deque, Optional, Dict
 
 try:
     from rich.console import Console, Group
@@ -46,6 +46,7 @@ class RuntimeStats:
     hits: int = 0
     speed_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
     last_speed: float = 0.0
+    extra_metrics: dict = field(default_factory=dict)
 
     def update_speed(self, addresses: int, elapsed: float) -> None:
         """更新速率資訊，不改變累計計數。"""
@@ -110,25 +111,16 @@ class VanitySearchMonitor:
             except Exception:  # pragma: no cover
                 pass
 
+    def set_start_time(self, start_ts: float) -> None:
+        """調整統計起始時間。"""
+
+        self._stats.start_time = start_ts
+
     def _build_layout(self) -> Layout:
-        """組裝監控畫面佈局。"""
+        """單面板佈局，移除多餘空白。"""
 
         layout = Layout(name="root")
-        layout.split(
-            Layout(name="header", size=3),
-            Layout(name="body"),
-            Layout(name="footer", size=3),
-        )
-        layout["header"].update(
-            Panel(
-                Text(f"目標靚號：{self._target}", style="bold magenta"),
-                border_style="bright_magenta",
-            )
-        )
-        layout["body"].update(self._build_body_panel())
-        layout["footer"].update(
-            Panel(Text("按 Ctrl+C 可優雅退出搜尋", style="yellow"), border_style="yellow")
-        )
+        layout.update(self._build_body_panel())
         return layout
 
     def _build_body_panel(self) -> Panel:
@@ -136,6 +128,7 @@ class VanitySearchMonitor:
 
         stats = self._stats
         metrics = self._collect_metrics()
+        extras: Dict[str, float] = stats.extra_metrics or {}
 
         info_table = Table.grid(padding=(0, 1))
         info_table.add_column(justify="right", style="cyan", width=12)
@@ -166,9 +159,50 @@ class VanitySearchMonitor:
         elif self._gpu_status_note:
             metrics_table.add_row("GPU 監控", self._gpu_status_note)
 
-        combined = Table.grid(padding=1)
-        combined.add_row(info_table, metrics_table)
-        return Panel(combined, border_style="bright_cyan", title="搜尋狀態")
+        pipeline_table = Table.grid(padding=(0, 1))
+        pipeline_table.add_column(justify="right", style="cyan", width=13)
+        pipeline_table.add_column(style="white")
+        current_batch = extras.get("current_batch")
+        if current_batch:
+            pipeline_table.add_row("批次大小", f"{int(current_batch):,} addr")
+        if extras.get("batch_time"):
+            pipeline_table.add_row("批次耗時", f"{extras['batch_time']:.3f} s")
+        if extras.get("pending_limit"):
+            pending_info = f"{int(extras['pending_limit'])}"
+            if extras.get("pending_base"):
+                pending_info += f" (基準 {int(extras['pending_base'])})"
+            pipeline_table.add_row("排程佇列", pending_info)
+        if extras.get("streams"):
+            pipeline_table.add_row("CUDA Streams", str(int(extras["streams"])))
+        if extras.get("next_batch"):
+            pipeline_table.add_row("下批預估", f"{int(extras['next_batch']):,}")
+        if extras.get("wnaf_used") is not None:
+            pipeline_table.add_row("Window4(累積)", "啟用" if extras["wnaf_used"] else "停用")
+        if extras.get("wnaf_last_used") is not None:
+            pipeline_table.add_row("Window4(本批)", "啟用" if extras["wnaf_last_used"] else "停用")
+        if extras.get("wnaf_limit") is not None:
+            limit_val = extras["wnaf_limit"]
+            base_val = extras.get("wnaf_base")
+            if limit_val and limit_val > 0:
+                label = f"{int(limit_val):,}"
+                if base_val and base_val > 0 and limit_val > base_val:
+                    label += " ↑"
+                elif base_val and base_val > 0 and limit_val < base_val:
+                    label += " ↓"
+                pipeline_table.add_row("Window4 門檻", label)
+            else:
+                pipeline_table.add_row("Window4 門檻", "無限制")
+        if extras.get("launch_sec"):
+            pipeline_table.add_row("內核啟動", f"{extras['launch_sec']:.2f} s")
+        if extras.get("batches"):
+            pipeline_table.add_row("累積批次", str(int(extras["batches"])))
+
+        combined = Table.grid(padding=(0, 1))
+        combined.add_row(info_table, metrics_table, pipeline_table)
+        panel = Panel.fit(combined, border_style="bright_cyan", padding=(0, 1))
+        panel.title = f"搜尋狀態 · 目標：{self._target}"
+        panel.subtitle = "Ctrl+C 結束搜尋"
+        return panel
 
     def _collect_metrics(self) -> dict:
         """採集 CPU/GPU 指標。"""
@@ -286,12 +320,23 @@ class VanitySearchMonitor:
             self._live.__exit__(None, None, None)
             self._live = None
 
-    def update(self, *, checked: int, hits: int, last_batch: int, elapsed: float) -> None:
+    def update(
+        self,
+        *,
+        checked: int,
+        hits: int,
+        last_batch: int,
+        elapsed: float,
+        metrics: Optional[Dict[str, float]],
+    ) -> None:
         """外部呼叫：更新統計並重繪畫面。"""
 
         self._stats.checked = checked
         self._stats.hits = hits
         self._stats.update_speed(last_batch, elapsed)
+        extra = metrics or {}
+        extra.setdefault("current_batch", last_batch)
+        self._stats.extra_metrics = extra
         if self._live is not None:
             layout = self._build_layout()
             self._live.update(layout, refresh=True)
