@@ -161,8 +161,6 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
         return replace(
             base,
             default_batches=(
-                65536,
-                131072,
                 262144,
                 393216,
                 524288,
@@ -171,17 +169,19 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
                 1310720,
                 1572864,
                 2097152,
+                2621440,
+                3145728,
             ),
-            default_streams=14,
-            wnaf_threshold=65536,
+            default_streams=16,
+            wnaf_threshold=262144,
             secp_threads=512,
             keccak_threads=512,
             sha_threads=512,
             base58_threads=512,
-            max_pending_multiplier=5,
+            max_pending_multiplier=6,
             memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.35),
-            max_batch_size=2097152,
-            estimated_addr_per_sec=950_000,
+            max_batch_size=3145728,
+            estimated_addr_per_sec=1_100_000,
         )
     if profile == "Ampere-Large":
         return replace(
@@ -216,7 +216,7 @@ def _compute_max_batch(defaults: Tuple[int, ...], total_mem_gb: float, backend: 
     if total_mem_gb <= 0:
         total_mem_gb = 1.0
     if backend == "GPU":
-        factor = 40_960  # 23 GiB -> 約 940k，可充分利用 L4 VRAM
+        factor = 200_000  # 約 0.2M addr / GiB，L4(15.6 GiB) -> ~3.1M
     else:
         factor = 1_024  # 16 GiB -> 約 16k
     mem_limit = _align(int(total_mem_gb * factor))

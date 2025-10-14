@@ -1729,28 +1729,38 @@ def generate_tron_addresses_gpu(
         batch_plan = [min(batch_size or 16384, cap_guess)]
 
     env_stream_override = os.environ.get("VANITY_GPU_STREAMS")
-    if stream_count is None and env_stream_override:
+    tuner_ready = getattr(_PERF_TUNER, "completed", False)
+    tuned_stream = getattr(_PERF_TUNER, "stream_target", _BASE_STREAM_COUNT)
+
+    if env_stream_override:
         try:
             stream_count = int(env_stream_override)
         except ValueError:
             stream_count = None
-    stream_candidate = _PERF_TUNER.select_stream_count(stream_count)
+    elif stream_count is not None:
+        try:
+            stream_count = int(stream_count)
+        except ValueError:
+            stream_count = None
+
     if stream_count is None:
-        stream_count = max(stream_candidate, _BASE_STREAM_COUNT)
-        if prefix_bytes is not None:
-            target = 6 if pref_len <= 3 else 8
-            stream_count = max(stream_count, target)
-        else:
-            max_candidate = batch_plan[-1] if batch_plan else batch_size
-            if max_candidate >= 393216:
-                stream_count = max(stream_count, 12)
-            elif max_candidate >= 262144:
-                stream_count = max(stream_count, 10)
-            elif max_candidate >= 131072:
-                stream_count = max(stream_count, 8)
-    else:
-        stream_count = stream_candidate
-    stream_count = max(2, min(20, int(stream_count)))
+        stream_count = int(tuned_stream) if tuner_ready and tuned_stream else _BASE_STREAM_COUNT
+
+    stream_count = max(2, int(stream_count))
+
+    max_candidate = batch_plan[-1] if batch_plan else batch_size
+    if prefix_bytes is not None:
+        target = 6 if pref_len <= 3 else 8
+        stream_count = max(stream_count, target)
+    elif not tuner_ready:
+        if max_candidate >= 393216:
+            stream_count = max(stream_count, 12)
+        elif max_candidate >= 262144:
+            stream_count = max(stream_count, 10)
+        elif max_candidate >= 131072:
+            stream_count = max(stream_count, 8)
+
+    stream_count = max(2, min(20, stream_count))
     global _CURRENT_STREAM_COUNT
     _CURRENT_STREAM_COUNT = stream_count
     dynamic_cap = _dynamic_cap_for_streams(stream_count)
