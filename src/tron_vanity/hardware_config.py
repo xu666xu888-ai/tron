@@ -180,6 +180,7 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
             base58_threads=512,
             max_pending_multiplier=5,
             memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.35),
+            max_batch_size=2097152,
             estimated_addr_per_sec=950_000,
         )
     if profile == "Ampere-Large":

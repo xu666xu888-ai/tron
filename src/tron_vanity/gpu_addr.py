@@ -1906,7 +1906,7 @@ def generate_tron_addresses_gpu(
                     no_hit_streak = 0
             else:
                 no_hit_streak = 0
-                next_batch = batch_plan[0]
+                next_batch = max(next_batch, cur)
         if drain_done:
             done = True
             break
@@ -1968,7 +1968,8 @@ def generate_tron_addresses_gpu(
         )
         if hits_added_rest > 0:
             no_hit_streak = 0
-            next_batch = batch_plan[0]
+            restored = _snap_batch_to_plan(ctx.size, batch_plan)
+            next_batch = max(next_batch, restored)
         else:
             no_hit_streak += 1
             if no_hit_streak >= max(3, stream_count):
