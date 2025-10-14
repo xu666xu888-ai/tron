@@ -161,15 +161,15 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
         return replace(
             base,
             default_batches=(32768, 65536, 131072, 262144, 393216, 524288, 786432, 917504),
-            default_streams=8,
+            default_streams=12,
             wnaf_threshold=32768,
-            secp_threads=256,
-            keccak_threads=256,
-            sha_threads=256,
-            base58_threads=256,
-            max_pending_multiplier=3,
-            memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.25),
-            estimated_addr_per_sec=700_000,
+            secp_threads=384,
+            keccak_threads=384,
+            sha_threads=384,
+            base58_threads=384,
+            max_pending_multiplier=4,
+            memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.35),
+            estimated_addr_per_sec=780_000,
         )
     if profile == "Ampere-Large":
         return replace(

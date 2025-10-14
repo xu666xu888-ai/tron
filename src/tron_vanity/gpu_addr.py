@@ -23,6 +23,8 @@ import time
 from typing import Dict, List, Tuple, Optional, Union, Sequence
 from dataclasses import dataclass, field
 from concurrent.futures import Future
+from collections import deque
+import importlib
 
 logger = logging.getLogger(__name__)
 
@@ -35,22 +37,33 @@ import base58
 import sha3
 import numpy as np
 
-from .hardware_config import HARDWARE_CONFIG
+from .hardware_config import HARDWARE_CONFIG, HardwareAdaptiveConfig
 
 _HARDWARE_CFG = HARDWARE_CONFIG
 
+try:
+    _GPU_FREE, _GPU_TOTAL = cp.cuda.runtime.memGetInfo()
+    _GPU_TOTAL = int(_GPU_TOTAL)
+except Exception:
+    _GPU_TOTAL = int(getattr(_HARDWARE_CFG, "total_mem_gb", 0) * (1024**3))
+    _GPU_FREE = 0
+_GPU_MEM_LIMIT = int(_GPU_TOTAL * 0.9) if _GPU_TOTAL else _HARDWARE_CFG.memory_pool_limit_bytes or 0
+if _GPU_MEM_LIMIT <= 0 and _HARDWARE_CFG.memory_pool_limit_bytes:
+    _GPU_MEM_LIMIT = int(_HARDWARE_CFG.memory_pool_limit_bytes)
+
 _DEVICE_POOL = cp.cuda.MemoryPool()
 cp.cuda.set_allocator(_DEVICE_POOL.malloc)
-if _HARDWARE_CFG.memory_pool_limit_bytes:
+if _GPU_MEM_LIMIT:
     try:
-        _DEVICE_POOL.set_limit(_HARDWARE_CFG.memory_pool_limit_bytes)
+        _DEVICE_POOL.set_limit(_GPU_MEM_LIMIT)
+        logger.info("[TUNER] 設定 GPU 記憶體池上限為 %.2f GiB (90%%)", _GPU_MEM_LIMIT / (1024**3))
     except Exception:  # pragma: no cover
         logger.warning("Memory pool limit 設定失敗，將使用預設值", exc_info=True)
 _PINNED_POOL = cp.cuda.PinnedMemoryPool()
 cp.cuda.set_pinned_memory_allocator(_PINNED_POOL.malloc)
-if _HARDWARE_CFG.memory_pool_limit_bytes:
+if _GPU_MEM_LIMIT:
     try:
-        _PINNED_POOL.set_limit(int(_HARDWARE_CFG.memory_pool_limit_bytes * 0.1))
+        _PINNED_POOL.set_limit(int(_GPU_MEM_LIMIT * 0.1))
     except Exception:  # pragma: no cover
         logger.debug("Pinned pool limit 設定失敗，忽略", exc_info=True)
 try:
@@ -69,6 +82,15 @@ try:
     from .gpu_secp256k1 import warmup_window4_table as _warmup_window4_table
 except Exception:
     _warmup_window4_table = None
+
+try:
+    _gpu_secp256k1_mod = importlib.import_module("tron_vanity.gpu_secp256k1")
+except Exception:
+    _gpu_secp256k1_mod = None
+try:
+    _gpu_keccak_mod = importlib.import_module("tron_vanity.gpu_keccak")
+except Exception:
+    _gpu_keccak_mod = None
 
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -177,14 +199,26 @@ _WNAF_READY = False
 _WNAF_BROKEN = False
 _WNAF_SIZE_LOGGED = False
 _WNAF_LAST_USED = False
+_WNAF_LAST_REASON = "init"
+_WNAF_SKIP_STREAK = 0
+
+if _USE_WNAF_DEFAULT and _warmup_window4_table is not None:
+    try:
+        _warmup_window4_table()
+        _WNAF_READY = True
+        logger.info("[WNAF] 模組初始化完成 Window4 預熱")
+    except Exception as exc:  # pragma: no cover
+        logger.warning("[WNAF] 模組初始化預熱失敗，將回退：%s", exc)
+        _WNAF_BROKEN = True
 
 
 def _wnaf_record_success(batch_size: int) -> None:
     global _WNAF_ADAPTIVE_LIMIT
     if _WNAF_ADAPTIVE_LIMIT <= 0:
         return
+    cap = _dynamic_cap_for_streams(_CURRENT_STREAM_COUNT)
     if batch_size > _WNAF_ADAPTIVE_LIMIT:
-        _WNAF_ADAPTIVE_LIMIT = batch_size
+        _WNAF_ADAPTIVE_LIMIT = min(batch_size, cap)
         logger.info("[WNAF] 自適應門檻提升至 %d", _WNAF_ADAPTIVE_LIMIT)
 
 
@@ -194,6 +228,8 @@ def _wnaf_record_failure(batch_size: int) -> None:
         return
     if batch_size >= _WNAF_ADAPTIVE_LIMIT:
         new_limit = max(_WNAF_BASE_THRESHOLD, batch_size // 2)
+        cap = _dynamic_cap_for_streams(_CURRENT_STREAM_COUNT)
+        new_limit = min(new_limit, cap)
         if new_limit < _WNAF_ADAPTIVE_LIMIT:
             _WNAF_ADAPTIVE_LIMIT = new_limit
             logger.warning("[WNAF] 內核在批次 %d 失敗，自適應門檻降至 %d", batch_size, _WNAF_ADAPTIVE_LIMIT)
@@ -210,6 +246,214 @@ _SECP_THREADS = int(os.environ.get("VANITY_SECP_THREADS", str(_HARDWARE_CFG.secp
 _KECCAK_THREADS = int(os.environ.get("VANITY_KECCAK_THREADS", str(_HARDWARE_CFG.keccak_threads)))
 _SHA_THREADS = int(os.environ.get("VANITY_SHA_THREADS", str(_HARDWARE_CFG.sha_threads)))
 _BASE58_THREADS = int(os.environ.get("VANITY_BASE58_THREADS", str(_HARDWARE_CFG.base58_threads)))
+
+_AUTOTUNE_DISABLED = os.environ.get("VANITY_DISABLE_AUTOTUNE") == "1"
+try:
+    _AUTOTUNE_TRIAL_SIZE = int(os.environ.get("VANITY_AUTOTUNE_TRIAL", "262144"))
+except ValueError:
+    _AUTOTUNE_TRIAL_SIZE = 262144
+_AUTO_TUNING = False
+_CURRENT_STREAM_COUNT = _BASE_STREAM_COUNT or 1
+
+_PER_ITEM_ESTIMATE = 220  # bytes per item per stream（估算）
+_DEF_MAX_BATCH = _HARDWARE_CFG.max_batch_size or (_DEFAULT_DYNAMIC_BATCHES[-1] if _DEFAULT_DYNAMIC_BATCHES else 262144)
+if _DEF_MAX_BATCH <= 0:
+    _DEF_MAX_BATCH = 262144
+if _GPU_MEM_LIMIT:
+    mem_based_limit = int(_GPU_MEM_LIMIT / (_PER_ITEM_ESTIMATE * max(1, _BASE_STREAM_COUNT)))
+    mem_based_limit = max(256, (mem_based_limit // 256) * 256)
+    if mem_based_limit > 0:
+        _DEF_MAX_BATCH = max(_DEF_MAX_BATCH, mem_based_limit)
+_WNAF_DYNAMIC_BASE = max(_WNAF_BATCH_THRESHOLD, int(_DEF_MAX_BATCH * 0.9))
+_WNAF_DYNAMIC_BASE = max(256, (_WNAF_DYNAMIC_BASE // 256) * 256)
+
+
+def _dynamic_cap_for_streams(streams: Optional[int]) -> int:
+    cap = _WNAF_DYNAMIC_BASE
+    stream_val = max(1, streams or _BASE_STREAM_COUNT or 1)
+    if _GPU_MEM_LIMIT:
+        mem_cap = int(_GPU_MEM_LIMIT / (_PER_ITEM_ESTIMATE * stream_val))
+        mem_cap = max(256, (mem_cap // 256) * 256)
+        cap = min(cap, mem_cap) if cap else mem_cap
+    return max(256, cap)
+
+
+dynamic_cap_init = _dynamic_cap_for_streams(_BASE_STREAM_COUNT)
+if _WNAF_ADAPTIVE_LIMIT > 0:
+    _WNAF_ADAPTIVE_LIMIT = min(_WNAF_ADAPTIVE_LIMIT, dynamic_cap_init)
+elif _WNAF_BATCH_THRESHOLD > 0:
+    _WNAF_ADAPTIVE_LIMIT = min(_WNAF_BATCH_THRESHOLD, dynamic_cap_init)
+
+
+def _apply_thread_setting(threads: int) -> int:
+    """同步更新所有與 thread 數相關的全域設定。"""
+
+    threads = int(max(128, min(1024, threads)))
+    global _SECP_THREADS, _KECCAK_THREADS, _SHA_THREADS, _BASE58_THREADS
+    _SECP_THREADS = threads
+    _KECCAK_THREADS = threads
+    _SHA_THREADS = threads
+    _BASE58_THREADS = threads
+    if _gpu_secp256k1_mod is not None:
+        try:
+            _gpu_secp256k1_mod._SECP_THREADS = threads
+        except Exception:
+            logger.debug("[TUNER] 無法更新 gpu_secp256k1 threads", exc_info=True)
+    if _gpu_keccak_mod is not None:
+        try:
+            _gpu_keccak_mod._KECCAK_THREADS = threads
+        except Exception:
+            logger.debug("[TUNER] 無法更新 gpu_keccak threads", exc_info=True)
+    logger.info("[TUNER] kernel threads 設定為 %d", threads)
+    return threads
+
+
+class _PerformanceTuner:
+    """根據硬體自動探索最適 streams / threads 組合。"""
+
+    def __init__(self, cfg: "HardwareAdaptiveConfig") -> None:
+        self.cfg = cfg
+        self.enabled = (
+            cfg.backend == "GPU"
+            and not _AUTOTUNE_DISABLED
+            and secp_gpu_batch is not None
+            and cp is not None
+        )
+        self.stream_max = min(20, max(4, (cfg.sm_count or 32)))
+        self.base_stream = min(self.stream_max, max(2, cfg.default_streams))
+        self.stream_target = self.base_stream
+        self.best_stream = self.base_stream
+        self.best_thread = cfg.secp_threads or 256
+        self.best_throughput = 0.0
+        self.completed = False
+        candidates = [cfg.max_batch_size, _AUTOTUNE_TRIAL_SIZE]
+        candidates.append(_dynamic_cap_for_streams(self.base_stream))
+        positives = [c for c in candidates if c and c > 0]
+        self.trial_batch = min(positives) if positives else _AUTOTUNE_TRIAL_SIZE
+        if self.trial_batch <= 0:
+            self.trial_batch = 0
+        self.stream_candidates = self._build_stream_candidates()
+        self.thread_candidates = self._build_thread_candidates()
+        if not self.enabled or self.trial_batch <= 0:
+            self.completed = True
+            _apply_thread_setting(self.best_thread)
+            return
+        # 預先套用預設 threads，實測後再調整
+        _apply_thread_setting(self.thread_candidates[0])
+
+    def _build_stream_candidates(self) -> List[int]:
+        base = self.base_stream
+        offsets = (-4, -2, 0, 2, 4)
+        candidates = {max(2, min(self.stream_max, base + off)) for off in offsets}
+        candidates.add(base)
+        ordered = sorted(candidates)
+        if base in ordered:
+            ordered.remove(base)
+        return [base] + ordered
+
+    def _build_thread_candidates(self) -> List[int]:
+        base = max(128, self.cfg.secp_threads or 256)
+        options = {base}
+        if self.cfg.compute_capability and self.cfg.compute_capability[0] >= 8:
+            options.add(512)
+        options.add(384)
+        options = {max(128, min(1024, opt)) for opt in options}
+        ordered = sorted(options)
+        return ordered
+
+    def ensure_calibrated(self) -> None:
+        if not self.enabled or self.completed:
+            return
+        logger.info(
+            "[TUNER] 自動調整啟動：候選 streams=%s, threads=%s, trial=%d",
+            self.stream_candidates,
+            self.thread_candidates,
+            self.trial_batch,
+        )
+        best_stream = self.best_stream
+        best_thread = self.best_thread
+        best_throughput = 0.0
+        for thread in self.thread_candidates:
+            _apply_thread_setting(thread)
+            for stream in self.stream_candidates:
+                throughput = self._measure(stream)
+                if throughput <= 0:
+                    continue
+                if throughput > best_throughput:
+                    best_throughput = throughput
+                    best_stream = stream
+                    best_thread = thread
+        if best_throughput > 0:
+            self.best_stream = best_stream
+            self.best_thread = best_thread
+            self.best_throughput = best_throughput
+            self.stream_target = best_stream
+            self.completed = True
+            _apply_thread_setting(best_thread)
+            global _BASE_STREAM_COUNT
+            _BASE_STREAM_COUNT = best_stream
+            logger.info(
+                "[TUNER] 自動調整完成：最佳 streams=%d, threads=%d, throughput=%.0f addr/s",
+                best_stream,
+                best_thread,
+                best_throughput,
+            )
+        else:
+            logger.warning("[TUNER] 未取得有效的自動調整結果，維持預設配置")
+            self.completed = True
+            _apply_thread_setting(self.best_thread)
+
+    def select_stream_count(self, override: Optional[int]) -> int:
+        if override is not None:
+            return int(override)
+        return self.stream_target
+
+    def record_run(self, stream_used: int, throughput: float) -> None:
+        if throughput <= 0:
+            return
+        if throughput > self.best_throughput:
+            self.best_throughput = throughput
+            self.best_stream = stream_used
+
+    def _measure(self, streams: int) -> float:
+        if self.trial_batch <= 0:
+            return 0.0
+        batch_size = self.trial_batch
+        if self.cfg.max_batch_size and self.cfg.max_batch_size > 0:
+            batch_size = min(batch_size, self.cfg.max_batch_size)
+        batch_size = min(batch_size, _dynamic_cap_for_streams(streams))
+        if batch_size <= 0:
+            return 0.0
+        global _AUTO_TUNING
+        prev = _AUTO_TUNING
+        _AUTO_TUNING = True
+        try:
+            _, _, stats = generate_tron_addresses_gpu(
+                count=batch_size,
+                batch_size=batch_size,
+                prefix=None,
+                suffix=None,
+                max_hits=0,
+                dynamic_batches=[batch_size],
+                stream_count=streams,
+                return_stats=True,
+            )
+        except Exception as exc:  # pragma: no cover - 失敗時回退
+            logger.debug("[TUNER] 測試 streams=%d threads=%d 失敗：%s", streams, _SECP_THREADS, exc)
+            return 0.0
+        finally:
+            _AUTO_TUNING = prev
+        throughput = stats["processed"] / max(stats["elapsed_sec"], 1e-6)
+        logger.debug(
+            "[TUNER] 測試結果 streams=%d threads=%d → %.0f addr/s",
+            streams,
+            _SECP_THREADS,
+            throughput,
+        )
+        return throughput
+
+
+_PERF_TUNER = _PerformanceTuner(_HARDWARE_CFG)
 
 logger.info(
     "偵測硬體配置：%s | 預設批次=%s | Streams(base)=%d | Window4 門檻=%d",
@@ -290,24 +534,31 @@ def _select_batch_size(remain: int, batch_plan: Sequence[int], stream_count: int
         free_mem, _ = cp.cuda.runtime.memGetInfo()
     except Exception:
         free_mem = 0
-    limit = int(free_mem * 0.8) if free_mem else 0
-    per_item = 384  # bytes（估算整體中間緩衝）
+    stream_count = max(stream_count, 1)
+    limit = int(free_mem * 0.85) if free_mem else 0
+    per_item = 220  # bytes（重新估算的中間緩衝）
     best = batch_plan[0]
+    aggressive_candidate = None
     for cand in batch_plan:
         cand = max(256, cand)
         if cand <= 0:
             continue
-        mem_need = cand * per_item * max(stream_count, 1)
+        mem_need = cand * per_item * stream_count
         if limit and mem_need > limit:
             if best == batch_plan[0]:
-                approx = limit // (per_item * max(stream_count, 1))
+                approx = limit // (per_item * stream_count)
                 if approx > 0:
                     return max(1, min(remain, approx))
             break
         best = cand
         if cand >= remain:
             break
-    target = min(best, remain)
+    if free_mem and best < remain:
+        headroom = limit - (best * per_item * stream_count)
+        if headroom > 0:
+            extra = int(best * 1.2)
+            aggressive_candidate = min(remain, extra)
+    target = aggressive_candidate or min(best, remain)
     if target <= 0:
         target = min(remain, batch_plan[0])
     return max(1, target)
@@ -727,7 +978,11 @@ _suffix_filter_mod = cp.RawModule(code=_SUFFIX_FILTER_KERNEL, options=("-std=c++
 _suffix_filter_kernel = _suffix_filter_mod.get_function("suffix_mod_filter")
 
 
-def gpu_sha256_oneblock_batch(msgs_gpu: "cp.ndarray", lens_gpu: "cp.ndarray") -> "cp.ndarray":
+def gpu_sha256_oneblock_batch(
+    msgs_gpu: "cp.ndarray",
+    lens_gpu: "cp.ndarray",
+    out: Optional["cp.ndarray"] = None,
+) -> "cp.ndarray":
     """在 GPU 上計算多筆 SHA-256（限制：每筆長度 <= 55，單區塊）。
     - msgs_gpu: uint8 (N, stride_in)
     - lens_gpu: int32 (N,)
@@ -739,7 +994,12 @@ def gpu_sha256_oneblock_batch(msgs_gpu: "cp.ndarray", lens_gpu: "cp.ndarray") ->
         raise ValueError("lens_gpu 需為 int32 (N,)")
     n = msgs_gpu.shape[0]
     stride_in = msgs_gpu.shape[1]
-    out = cp.zeros((n, 32), dtype=cp.uint8)
+    if out is not None:
+        if out.dtype != cp.uint8 or out.ndim != 2 or out.shape[0] != n or out.shape[1] != 32:
+            raise ValueError("out 需為 uint8 (N,32)")
+        out[:, :] = 0
+    else:
+        out = cp.zeros((n, 32), dtype=cp.uint8)
     threads = _SHA_THREADS
     blocks = (n + threads - 1) // threads
     _sha256_kernel((blocks,), (threads,), (msgs_gpu, lens_gpu, out, cp.int32(stride_in), cp.int32(32), cp.int32(n)))
@@ -936,25 +1196,19 @@ def _suffix_mod_filter(tron21_gpu: "cp.ndarray", target: int, mod_base: int) -> 
     n = tron21_gpu.shape[0]
     checksum_buf, checksum_owner = _acquire_gpu_array(n, 4, cp.uint8)
     try:
-        lens21, lens21_owner = _acquire_gpu_array(n, None, cp.int32)
+        lens_buf, lens_owner = _acquire_gpu_array(n, None, cp.int32)
+        hash_stage1, hash1_owner = _acquire_gpu_array(n, 32, cp.uint8)
+        hash_stage2, hash2_owner = _acquire_gpu_array(n, 32, cp.uint8)
         try:
-            lens21.fill(21)
-            d1 = gpu_sha256_oneblock_batch(tron21_gpu, lens21)
+            lens_buf.fill(21)
+            gpu_sha256_oneblock_batch(tron21_gpu, lens_buf, out=hash_stage1)
+            lens_buf.fill(32)
+            gpu_sha256_oneblock_batch(hash_stage1, lens_buf, out=hash_stage2)
+            checksum_buf[:, :] = hash_stage2[:, :4]
         finally:
-            _release_gpu_array(lens21_owner)
-
-        lens32, lens32_owner = _acquire_gpu_array(n, None, cp.int32)
-        try:
-            lens32.fill(32)
-            d2 = gpu_sha256_oneblock_batch(d1, lens32)
-        finally:
-            _release_gpu_array(lens32_owner)
-
-        checksum_buf[:, :] = d2[:, :4]
-        if 'd1' in locals():
-            del d1
-        if 'd2' in locals():
-            del d2
+            _release_gpu_array(hash2_owner)
+            _release_gpu_array(hash1_owner)
+            _release_gpu_array(lens_owner)
 
         mask_buf, mask_owner = _acquire_gpu_array(n, None, cp.uint8)
         try:
@@ -996,7 +1250,7 @@ def _launch_batch(
     hits_idx: Optional["cp.ndarray"] = None
     fallback_cpu = False
     buffer_map: Dict[str, Optional["cp.ndarray"]] = {}
-    global _WNAF_READY, _WNAF_BROKEN, _WNAF_LAST_USED, _WNAF_SIZE_LOGGED
+    global _WNAF_READY, _WNAF_BROKEN, _WNAF_LAST_USED, _WNAF_SIZE_LOGGED, _WNAF_LAST_REASON
     device_id = int(cp.cuda.Device())
 
     if not use_wnaf_requested and _USE_WNAF_DEFAULT and not _WNAF_SIZE_LOGGED:
@@ -1030,6 +1284,33 @@ def _launch_batch(
                 _WNAF_BROKEN = True
                 use_kernel = False
 
+        if use_kernel:
+            if not _WNAF_READY:
+                wnaf_reason = "warmup"
+            else:
+                wnaf_reason = "window4"
+        else:
+            if not use_wnaf_requested:
+                wnaf_reason = "adaptive-threshold"
+            elif _WNAF_BROKEN:
+                wnaf_reason = "broken-flag"
+            elif secp_gpu_batch_w4 is None:
+                wnaf_reason = "kernel-missing"
+            else:
+                wnaf_reason = "fallback"
+        logger.debug(
+            "[WNAF] 批次 %d 決策：use=%s reason=%s requested=%s limit=%d ready=%s broken=%s kernel=%s",
+            cur,
+            use_kernel,
+            wnaf_reason,
+            use_wnaf_requested,
+            _WNAF_ADAPTIVE_LIMIT,
+            _WNAF_READY,
+            _WNAF_BROKEN,
+            secp_gpu_batch_w4 is not None,
+        )
+        _WNAF_LAST_REASON = wnaf_reason
+
         pub65_gpu, pub_owner = _acquire_gpu_array(cur, 65, cp.uint8)
         buffer_map["pub65"] = pub_owner
         if use_kernel:
@@ -1038,9 +1319,11 @@ def _launch_batch(
                 pub65_gpu = secp_gpu_batch_w4(sk_gpu, out=pub65_gpu)
                 _WNAF_LAST_USED = True
                 _wnaf_record_success(cur)
-            except Exception:
+            except Exception as exc:
                 _WNAF_BROKEN = True
-                logger.warning("[WNAF] Window4 核心執行異常，改用標準版", exc_info=True)
+                logger.warning("[WNAF] Window4 核心執行異常(%s)，改用標準版", exc, exc_info=True)
+                logger.debug("[WNAF] 批次 %d 失敗原因：%s", cur, exc)
+                _WNAF_LAST_REASON = f"error:{exc}"
                 _wnaf_record_failure(cur)
                 if secp_gpu_batch is not None:
                     pub65_gpu = secp_gpu_batch(sk_gpu, out=pub65_gpu)
@@ -1052,6 +1335,9 @@ def _launch_batch(
                 pub65_gpu = secp_gpu_batch(sk_gpu, out=pub65_gpu)
             else:
                 pub65_gpu = gpu_secp256k1_batch(sk_gpu, out=pub65_gpu)
+        logger.debug(
+            "[WNAF] 批次 %d 完成：last_used=%s broken=%s", cur, _WNAF_LAST_USED, _WNAF_BROKEN
+        )
 
         xy_gpu = pub65_gpu[:, 1:]
         tron21_gpu, tron_owner = _acquire_gpu_array(cur, 21, cp.uint8)
@@ -1371,11 +1657,20 @@ def generate_tron_addresses_gpu(
     if count <= 0:
         return [], []
 
+    if not _AUTO_TUNING:
+        try:
+            _PERF_TUNER.ensure_calibrated()
+        except Exception:  # pragma: no cover - 自動調整失敗時記錄但不中斷
+            logger.warning("[TUNER] 自動調整失敗，維持預設配置", exc_info=True)
+
     results: List[Tuple[str, str]] = []
     privkeys_out: List[bytes] = []
     batches_executed = 0
     launch_time_total = 0.0
     wnaf_used_any = False
+    wnaf_success_streak = 0
+    global _WNAF_SKIP_STREAK
+    wnaf_promotions = 0
     start_time_total = time.perf_counter()
 
     global _WNAF_ADAPTIVE_LIMIT
@@ -1425,6 +1720,13 @@ def generate_tron_addresses_gpu(
     done = False
 
     batch_plan = _prepare_batch_plan(batch_size, dynamic_batches)
+    cap_guess = _dynamic_cap_for_streams(None)
+    batch_plan = [min(int(max(1, val)), cap_guess) for val in batch_plan]
+    batch_plan = sorted(set(batch_plan))
+    if batch_plan and batch_plan[-1] < cap_guess:
+        batch_plan.append(cap_guess)
+    elif not batch_plan:
+        batch_plan = [min(batch_size or 16384, cap_guess)]
 
     env_stream_override = os.environ.get("VANITY_GPU_STREAMS")
     if stream_count is None and env_stream_override:
@@ -1432,18 +1734,26 @@ def generate_tron_addresses_gpu(
             stream_count = int(env_stream_override)
         except ValueError:
             stream_count = None
+    stream_candidate = _PERF_TUNER.select_stream_count(stream_count)
     if stream_count is None:
-        stream_count = _BASE_STREAM_COUNT
+        stream_count = max(stream_candidate, _BASE_STREAM_COUNT)
         if prefix_bytes is not None:
             target = 6 if pref_len <= 3 else 8
             stream_count = max(stream_count, target)
         else:
             max_candidate = batch_plan[-1] if batch_plan else batch_size
-            if max_candidate >= 262144:
-                stream_count = max(stream_count, 8)
+            if max_candidate >= 393216:
+                stream_count = max(stream_count, 12)
+            elif max_candidate >= 262144:
+                stream_count = max(stream_count, 10)
             elif max_candidate >= 131072:
-                stream_count = max(stream_count, 6)
-    stream_count = max(2, min(8, int(stream_count)))
+                stream_count = max(stream_count, 8)
+    else:
+        stream_count = stream_candidate
+    stream_count = max(2, min(20, int(stream_count)))
+    global _CURRENT_STREAM_COUNT
+    _CURRENT_STREAM_COUNT = stream_count
+    dynamic_cap = _dynamic_cap_for_streams(stream_count)
 
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(stream_count)]
     pending: List[_BatchContext] = []
@@ -1474,16 +1784,54 @@ def generate_tron_addresses_gpu(
         if desired < batch_plan[0]:
             desired = batch_plan[0] if remain >= batch_plan[0] else remain
         desired = max(1, int(desired))
+        desired = min(desired, dynamic_cap)
         plan_with_desired = sorted(set(batch_plan + [desired]))
         cur = _select_batch_size(remain, plan_with_desired, stream_count)
         cur = min(cur, remain)
         cur = max(1, cur)
+        cur = min(cur, dynamic_cap)
         processed += cur
 
         stream = streams[stream_idx % stream_count]
         stream_idx += 1
         adaptive_limit = _WNAF_ADAPTIVE_LIMIT
         use_wnaf_this_batch = use_wnaf_kernel and (adaptive_limit <= 0 or cur <= adaptive_limit)
+        threshold_skipped = False
+        if (
+            use_wnaf_kernel
+            and not _WNAF_BROKEN
+            and adaptive_limit > 0
+            and cur > adaptive_limit
+        ):
+            threshold_skipped = True
+            _WNAF_SKIP_STREAK += 1
+            logger.debug(
+                "[WNAF] 批次 %d 超出門檻 %d（連續 %d 次）",
+                cur,
+                adaptive_limit,
+                _WNAF_SKIP_STREAK,
+            )
+            if _WNAF_SKIP_STREAK >= 3:
+                new_limit = _snap_batch_to_plan(cur, batch_plan)
+                new_limit = min(new_limit, dynamic_cap)
+                if new_limit > _WNAF_ADAPTIVE_LIMIT:
+                    wnaf_promotions += 1
+                    _WNAF_ADAPTIVE_LIMIT = new_limit
+                    logger.info(
+                        "[WNAF] 長批次連續 %d 次觸發，門檻提升至 %d",
+                        _WNAF_SKIP_STREAK,
+                        _WNAF_ADAPTIVE_LIMIT,
+                    )
+                adaptive_limit = _WNAF_ADAPTIVE_LIMIT
+                use_wnaf_this_batch = use_wnaf_kernel and (
+                    adaptive_limit <= 0 or cur <= adaptive_limit
+                )
+                next_batch = max(next_batch, _snap_batch_to_plan(adaptive_limit, batch_plan))
+                _WNAF_SKIP_STREAK = 0
+        if not threshold_skipped:
+            if use_wnaf_this_batch or not use_wnaf_kernel or _WNAF_BROKEN:
+                _WNAF_SKIP_STREAK = 0
+
         launch_start = time.perf_counter()
         ctx = _launch_batch(
             cur,
@@ -1498,6 +1846,34 @@ def generate_tron_addresses_gpu(
         launch_time_total += time.perf_counter() - launch_start
         batches_executed += 1
         wnaf_used_any = wnaf_used_any or _WNAF_LAST_USED
+        if use_wnaf_this_batch:
+            if _WNAF_LAST_USED:
+                wnaf_success_streak += 1
+            else:
+                wnaf_success_streak = 0
+        elif _WNAF_BROKEN:
+            wnaf_success_streak = 0
+        if (
+            use_wnaf_kernel
+            and not _WNAF_BROKEN
+            and _WNAF_LAST_USED
+            and wnaf_success_streak >= 3
+            and _WNAF_ADAPTIVE_LIMIT > 0
+            and _WNAF_ADAPTIVE_LIMIT < max_batch_plan
+        ):
+            promote_target = max(cur, int(_WNAF_ADAPTIVE_LIMIT * 3 // 2))
+            new_limit = _snap_batch_to_plan(promote_target, batch_plan)
+            new_limit = min(new_limit, dynamic_cap)
+            if new_limit > _WNAF_ADAPTIVE_LIMIT:
+                wnaf_promotions += 1
+                _WNAF_ADAPTIVE_LIMIT = new_limit
+                logger.info(
+                    "[WNAF] 連續成功 %d 次，門檻提升至 %d",
+                    wnaf_success_streak,
+                    _WNAF_ADAPTIVE_LIMIT,
+                )
+                next_batch = max(next_batch, _snap_batch_to_plan(_WNAF_ADAPTIVE_LIMIT, batch_plan))
+            wnaf_success_streak = 0
         ctx.cpu_future = asyncio.run_coroutine_threadsafe(
             _process_context_async(ctx, prefix_bytes, prefix_str, suffix_bytes, suffix_str), async_loop
         )
@@ -1525,7 +1901,7 @@ def generate_tron_addresses_gpu(
                     desired_growth = min(max_batch_plan, int(next_batch * 1.5))
                     next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
                     if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
-                        _WNAF_ADAPTIVE_LIMIT = next_batch
+                        _WNAF_ADAPTIVE_LIMIT = min(next_batch, dynamic_cap)
                         logger.info("[WNAF] 自適應門檻提升至 %d (探索較大批次)", _WNAF_ADAPTIVE_LIMIT)
                     no_hit_streak = 0
             else:
@@ -1559,7 +1935,7 @@ def generate_tron_addresses_gpu(
                     desired_growth = min(max_batch_plan, int(next_batch * 1.5))
                     next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
                     if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
-                        _WNAF_ADAPTIVE_LIMIT = next_batch
+                        _WNAF_ADAPTIVE_LIMIT = min(next_batch, dynamic_cap)
                         logger.info("[WNAF] 自適應門檻提升至 %d (pending flush)", _WNAF_ADAPTIVE_LIMIT)
                     no_hit_streak = 0
             if wait_done:
@@ -1599,7 +1975,7 @@ def generate_tron_addresses_gpu(
                 desired_growth = min(max_batch_plan, int(next_batch * 1.5))
                 next_batch = _snap_batch_to_plan(desired_growth, batch_plan)
                 if _WNAF_ADAPTIVE_LIMIT > 0 and next_batch > _WNAF_ADAPTIVE_LIMIT:
-                    _WNAF_ADAPTIVE_LIMIT = next_batch
+                    _WNAF_ADAPTIVE_LIMIT = min(next_batch, dynamic_cap)
                     logger.info("[WNAF] 自適應門檻提升至 %d (flush)", _WNAF_ADAPTIVE_LIMIT)
                 no_hit_streak = 0
         if done_flag_rest:
@@ -1607,6 +1983,12 @@ def generate_tron_addresses_gpu(
             break
 
     total_elapsed = time.perf_counter() - start_time_total
+    throughput_current = processed / max(total_elapsed, 1e-6) if processed > 0 else 0.0
+    if not _AUTO_TUNING:
+        try:
+            _PERF_TUNER.record_run(stream_count, throughput_current)
+        except Exception:  # pragma: no cover
+            logger.debug("[TUNER] 記錄執行情況時發生例外", exc_info=True)
     if return_stats:
         stats = {
             "requested": count,
@@ -1614,10 +1996,17 @@ def generate_tron_addresses_gpu(
             "batches": batches_executed,
             "elapsed_sec": total_elapsed,
             "launch_sec": launch_time_total,
+            "throughput": throughput_current,
             "wnaf_used": wnaf_used_any,
             "wnaf_limit": _WNAF_ADAPTIVE_LIMIT,
             "wnaf_base": _WNAF_BASE_THRESHOLD,
             "wnaf_last_used": _WNAF_LAST_USED,
+            "wnaf_skip_streak": _WNAF_SKIP_STREAK,
+            "wnaf_success_streak": wnaf_success_streak,
+            "wnaf_promotions": wnaf_promotions,
+            "wnaf_last_reason": _WNAF_LAST_REASON,
+            "wnaf_kernel_enabled": use_wnaf_kernel,
+            "wnaf_broken": _WNAF_BROKEN,
             "pending_limit": pending_limit,
             "pending_base": base_pending_limit,
             "next_batch": next_batch,

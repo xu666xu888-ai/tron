@@ -14,7 +14,6 @@ from typing import Deque, Optional, Dict
 
 try:
     from rich.console import Console, Group
-    from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
@@ -22,7 +21,6 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - 若 rich 未安裝，CLI 會先自動補齊
     Console = None  # type: ignore
     Group = None  # type: ignore
-    Layout = None  # type: ignore
     Live = None  # type: ignore
     Panel = None  # type: ignore
     Table = None  # type: ignore
@@ -95,7 +93,7 @@ class VanitySearchMonitor:
     """簡易 Rich Live 監控器。"""
 
     def __init__(self, console: Console, target: str, refresh_per_second: int = 4):
-        if Live is None or Layout is None or Panel is None:
+        if Live is None or Panel is None:
             raise RuntimeError("需安裝 rich 套件才能啟用監控介面")
         self._console = console
         self._target = target
@@ -115,13 +113,6 @@ class VanitySearchMonitor:
         """調整統計起始時間。"""
 
         self._stats.start_time = start_ts
-
-    def _build_layout(self) -> Layout:
-        """單面板佈局，移除多餘空白。"""
-
-        layout = Layout(name="root")
-        layout.update(self._build_body_panel())
-        return layout
 
     def _build_body_panel(self) -> Panel:
         """產出核心統計面板。"""
@@ -194,11 +185,28 @@ class VanitySearchMonitor:
                 pipeline_table.add_row("Window4 門檻", "無限制")
         if extras.get("launch_sec"):
             pipeline_table.add_row("內核啟動", f"{extras['launch_sec']:.2f} s")
+        if extras.get("throughput"):
+            pipeline_table.add_row("本批吞吐", f"{extras['throughput']:,.0f} addr/s")
         if extras.get("batches"):
             pipeline_table.add_row("累積批次", str(int(extras["batches"])))
+        if extras.get("wnaf_skip_streak") is not None:
+            pipeline_table.add_row("Window4 跳過", f"{int(extras['wnaf_skip_streak'])} 次")
+        if extras.get("wnaf_success_streak") is not None:
+            pipeline_table.add_row("Window4 連勝", f"{int(extras['wnaf_success_streak'])} 次")
+        if extras.get("wnaf_promotions") is not None:
+            pipeline_table.add_row("Window4 調整", f"{int(extras['wnaf_promotions'])} 次")
+        if extras.get("wnaf_broken") is not None:
+            kernel_state = "異常" if extras["wnaf_broken"] else (
+                "啟用" if extras.get("wnaf_kernel_enabled") else "停用"
+            )
+            pipeline_table.add_row("Window4 核心", kernel_state)
+        if extras.get("wnaf_last_reason"):
+            reason = str(extras["wnaf_last_reason"])
+            if len(reason) > 36:
+                reason = reason[:33] + "..."
+            pipeline_table.add_row("Window4 決策", reason)
 
-        combined = Table.grid(padding=(0, 1))
-        combined.add_row(info_table, metrics_table, pipeline_table)
+        combined = Group(info_table, metrics_table, pipeline_table)
         panel = Panel.fit(combined, border_style="bright_cyan", padding=(0, 1))
         panel.title = f"搜尋狀態 · 目標：{self._target}"
         panel.subtitle = "Ctrl+C 結束搜尋"
@@ -304,9 +312,8 @@ class VanitySearchMonitor:
 
         if self._live is not None:
             return
-        layout = self._build_layout()
         self._live = Live(
-            layout,
+            self._build_body_panel(),
             console=self._console,
             refresh_per_second=self._refresh_per_second,
             transient=False,
@@ -338,8 +345,7 @@ class VanitySearchMonitor:
         extra.setdefault("current_batch", last_batch)
         self._stats.extra_metrics = extra
         if self._live is not None:
-            layout = self._build_layout()
-            self._live.update(layout, refresh=True)
+            self._live.update(self._build_body_panel(), refresh=True)
 
 
 __all__ = [

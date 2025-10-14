@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -31,6 +32,58 @@ DEFAULT_CONFIG_LOCATIONS = (
 )
 HISTORY_PATH = Path.home() / ".tron_vanity_history.jsonl"
 SESSION_POLL_INTERVAL = 0.5
+_LOG_LEVEL_ENV = "VANITY_LOG_LEVEL"
+_LOG_KEEP_ENV = "VANITY_LOG_KEEP_BYTES"
+_DEFAULT_LOG_KEEP = 512_000  # 512 KB
+
+
+def _configure_logging() -> None:
+    """根據環境變數設定 logging 等級。"""
+
+    level_name = os.environ.get(_LOG_LEVEL_ENV, "").strip().upper()
+    default_level = logging.INFO
+    if level_name:
+        level = getattr(logging, level_name, None)
+        if not isinstance(level, int):
+            level = default_level
+    else:
+        level = default_level
+
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+    else:
+        root.setLevel(level)
+    logging.getLogger("tron_vanity").setLevel(level)
+    root.debug("啟用 logging，VANITY_LOG_LEVEL=%s", level_name or "INFO")
+
+
+def _trim_worker_log(log_file: Path) -> None:
+    """確保 worker 日誌不會無限制增長，只保留尾端區段。"""
+
+    try:
+        keep_raw = os.environ.get(_LOG_KEEP_ENV)
+        keep_bytes = int(keep_raw) if keep_raw else _DEFAULT_LOG_KEEP
+    except ValueError:
+        keep_bytes = _DEFAULT_LOG_KEEP
+    if keep_bytes <= 0:
+        return
+    try:
+        if not log_file.exists():
+            return
+        size = log_file.stat().st_size
+        if size <= keep_bytes:
+            return
+        with log_file.open("rb") as fh:
+            fh.seek(-keep_bytes, os.SEEK_END)
+            data = fh.read()
+        with log_file.open("wb") as fh:
+            fh.write(data)
+    except Exception:  # pragma: no cover
+        logging.getLogger(__name__).debug("Worker log trim 失敗，忽略", exc_info=True)
 
 
 class StopRequested(Exception):
@@ -568,6 +621,7 @@ def _start_background_worker(session_path: Path) -> int:
         env["PYTHONPATH"] = str(src_root)
     log_file = get_log_file()
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    _trim_worker_log(log_file)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     state = load_session(session_path) or {}
     suffix = state.get("task", {}).get("suffix", "-")
@@ -611,6 +665,51 @@ def _wait_for_session_completion(console: "Console", session_path: Path, timeout
         time.sleep(0.5)
     console.print("[yellow]背景任務仍在執行，請稍後使用 --attach 查看或再次嘗試止任務。[/yellow]")
     return False
+
+
+def _handle_active_session(
+    console: "Console",
+    args: argparse.Namespace,
+    session_path: Optional[Path] = None,
+) -> Optional[int]:
+    """偵測並處理既有背景任務，視使用者選擇決定後續流程。"""
+
+    session_path = session_path or get_session_file()
+    existing_state = load_session(session_path)
+    if not existing_state:
+        return None
+    pid = existing_state.get("pid")
+    if not pid or not is_session_active(session_path):
+        clear_session(session_path)
+        return None
+
+    task_existing = existing_state.get("task", {})
+    suffix_existing = task_existing.get("suffix", "-")
+    status_existing = existing_state.get("status", "running")
+    console.print(
+        f"[yellow]偵測到背景搜尋任務正在執行：PID {pid}，目標尾碼 {suffix_existing}，狀態 {status_existing}。[/yellow]"
+    )
+
+    if args.yes or not sys.stdin.isatty():
+        console.print("[cyan]已自動接續顯示背景任務，可使用 --stop 終止。[/cyan]")
+        return _attach_session(console)
+
+    while True:
+        choice = console.input(
+            "[bold cyan]選擇操作：[/bold cyan]"
+            "[A] 接續顯示 / [R] 停止並重新設定 / [Q] 取消："
+        ).strip().lower()
+        if choice in {"", "a", "attach"}:
+            return _attach_session(console)
+        if choice in {"r", "replace", "s", "stop"}:
+            _stop_session(console)
+            if _wait_for_session_completion(console, session_path):
+                return None
+            return 0
+        if choice in {"q", "cancel", "n"}:
+            console.print("[yellow]已取消操作，背景任務持續執行。[/yellow]")
+            return 0
+        console.print("[red]無效的選項，請重新輸入。[/red]")
 
 
 def _build_search_result_from_state(state: dict) -> Optional[SearchResult]:
@@ -882,6 +981,7 @@ def _worker_main(args: argparse.Namespace) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI 主流程。"""
 
+    _configure_logging()
     args = _parse_args(argv)
     if args.worker:
         return _worker_main(args)
@@ -899,6 +999,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "no_auto_install_cli": bool(args.no_auto_install),
         "preset_cli": args.preset is not None,
     }
+    session_path = get_session_file()
+    early_session_result = _handle_active_session(console, args, session_path)
+    if early_session_result is not None:
+        return early_session_result
+
     config, config_path = _load_cli_config(args.config)
     meta = _apply_config(args, config, user_flags)
     config = _ensure_config_structure(config)
@@ -999,37 +1104,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.cpu_only and hw_config.backend != "CPU":
         hw_config = detect_hardware_config(force_cpu=True)
-
-    session_path = get_session_file()
-    existing_state = load_session(session_path)
-    if existing_state and existing_state.get("pid") and is_session_active(session_path):
-        task_existing = existing_state.get("task", {})
-        suffix_existing = task_existing.get("suffix", "-")
-        status_existing = existing_state.get("status", "running")
-        pid_existing = existing_state.get("pid")
-        console.print(
-            f"[yellow]偵測到背景搜尋任務正在執行：PID {pid_existing}，目標尾碼 {suffix_existing}，狀態 {status_existing}。[/yellow]"
-        )
-        if args.yes or not sys.stdin.isatty():
-            console.print("[cyan]已自動接續顯示背景任務，可使用 --stop 終止。[/cyan]")
-            return _attach_session(console)
-
-        while True:
-            choice = console.input(
-                "[bold cyan]選擇操作：[/bold cyan]"
-                "[A] 接續顯示 / [R] 停止並重新設定 / [Q] 取消："
-            ).strip().lower()
-            if choice in {"", "a", "attach"}:
-                return _attach_session(console)
-            if choice in {"r", "replace", "s", "stop"}:
-                _stop_session(console)
-                if not _wait_for_session_completion(console, session_path):
-                    return 0
-                break
-            if choice in {"q", "cancel", "n"}:
-                console.print("[yellow]已取消操作，背景任務持續執行。[/yellow]")
-                return 0
-            console.print("[red]無效的選項，請重新輸入。[/red]")
 
     console.print("[cyan]初始設定完畢，背景搜尋即將啟動…[/cyan]")
 
