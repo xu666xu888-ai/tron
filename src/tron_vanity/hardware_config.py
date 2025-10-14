@@ -160,27 +160,16 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
     if profile == "L4":
         return replace(
             base,
-            default_batches=(
-                65536,
-                131072,
-                262144,
-                393216,
-                524288,
-                786432,
-                1048576,
-                1310720,
-                1572864,
-                2097152,
-            ),
-            default_streams=14,
-            wnaf_threshold=65536,
-            secp_threads=512,
-            keccak_threads=512,
-            sha_threads=512,
-            base58_threads=512,
-            max_pending_multiplier=5,
+            default_batches=(32768, 65536, 131072, 262144, 393216, 524288, 786432, 917504),
+            default_streams=12,
+            wnaf_threshold=32768,
+            secp_threads=384,
+            keccak_threads=384,
+            sha_threads=384,
+            base58_threads=384,
+            max_pending_multiplier=4,
             memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.35),
-            estimated_addr_per_sec=950_000,
+            estimated_addr_per_sec=780_000,
         )
     if profile == "Ampere-Large":
         return replace(
