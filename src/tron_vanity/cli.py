@@ -558,8 +558,14 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 def _start_background_worker(session_path: Path) -> int:
     """啟動背景工作進程，並將輸出寫入共用日誌。"""
 
-    cmd = [sys.executable, "-m", "tron_vanity", "--worker", "--session-file", str(session_path)]
+    cmd = [sys.executable, "-m", "tron_vanity.cli", "--worker", "--session-file", str(session_path)]
     env = os.environ.copy()
+    src_root = Path(__file__).resolve().parents[1]  # 指向 .../src
+    env_py = env.get("PYTHONPATH")
+    if env_py:
+        env["PYTHONPATH"] = f"{src_root}{os.pathsep}{env_py}"
+    else:
+        env["PYTHONPATH"] = str(src_root)
     log_file = get_log_file()
     log_file.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -593,6 +599,18 @@ def _stop_session(console: "Console") -> int:
     request_stop(session_path)
     console.print("[cyan]已送出停止請求，可稍後使用 --attach 查看狀態。[/cyan]")
     return 0
+
+
+def _wait_for_session_completion(console: "Console", session_path: Path, timeout: float = 60.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if not is_session_active(session_path):
+            clear_session(session_path)
+            console.print("[green]背景搜尋任務已停止，可重新設定新的任務。[/green]")
+            return True
+        time.sleep(0.5)
+    console.print("[yellow]背景任務仍在執行，請稍後使用 --attach 查看或再次嘗試止任務。[/yellow]")
+    return False
 
 
 def _build_search_result_from_state(state: dict) -> Optional[SearchResult]:
@@ -982,9 +1000,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cpu_only and hw_config.backend != "CPU":
         hw_config = detect_hardware_config(force_cpu=True)
 
-    if is_session_active():
-        console.print("[yellow]偵測到背景搜尋任務正在執行，改為接續顯示。[/yellow]")
-        return _attach_session(console)
+    session_path = get_session_file()
+    existing_state = load_session(session_path)
+    if existing_state and existing_state.get("pid") and is_session_active(session_path):
+        task_existing = existing_state.get("task", {})
+        suffix_existing = task_existing.get("suffix", "-")
+        status_existing = existing_state.get("status", "running")
+        pid_existing = existing_state.get("pid")
+        console.print(
+            f"[yellow]偵測到背景搜尋任務正在執行：PID {pid_existing}，目標尾碼 {suffix_existing}，狀態 {status_existing}。[/yellow]"
+        )
+        if args.yes or not sys.stdin.isatty():
+            console.print("[cyan]已自動接續顯示背景任務，可使用 --stop 終止。[/cyan]")
+            return _attach_session(console)
+
+        while True:
+            choice = console.input(
+                "[bold cyan]選擇操作：[/bold cyan]"
+                "[A] 接續顯示 / [R] 停止並重新設定 / [Q] 取消："
+            ).strip().lower()
+            if choice in {"", "a", "attach"}:
+                return _attach_session(console)
+            if choice in {"r", "replace", "s", "stop"}:
+                _stop_session(console)
+                if not _wait_for_session_completion(console, session_path):
+                    return 0
+                break
+            if choice in {"q", "cancel", "n"}:
+                console.print("[yellow]已取消操作，背景任務持續執行。[/yellow]")
+                return 0
+            console.print("[red]無效的選項，請重新輸入。[/red]")
 
     console.print("[cyan]初始設定完畢，背景搜尋即將啟動…[/cyan]")
 
@@ -1003,7 +1048,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "args_settings": _collect_settings_from_args(args),
     }
 
-    session_path = get_session_file()
     clear_session(session_path)
     initialize_session(task_payload, session_path)
     pid = _start_background_worker(session_path)
