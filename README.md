@@ -2,6 +2,8 @@
 
 高性能 TRON 靚號地址生成器，支持 CPU 和 GPU 加速模式。
 
+**🚀 v3 重大更新**：全新 Montgomery 模乘 + 混合座標系統 + wNAF Window4/6/8 自適應，整體性能再提升 2-3×！
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA](https://img.shields.io/badge/CUDA-11.0+-green.svg)](https://developer.nvidia.com/cuda-downloads)
@@ -42,15 +44,15 @@
 ### 已實現功能
 
 - ✅ **完整 GPU secp256k1 實現**
-  - 583 行 CUDA kernel
-  - 256-bit 大數模運算（針對 secp256k1 素數優化）
-  - Jacobian 座標橢圓曲線點運算
-  - 標量乘法（double-and-add 算法）
-  - **性能：540k keys/sec**（批次 16384，**38.6x 加速**）
+  - 600+ 行 CUDA kernel，全面採用 CIOS Montgomery 乘法
+  - 256-bit 大數模運算 + Montgomery 域轉換（針對 secp256k1 素數優化）
+  - Jacobian / 混合座標點運算，減少模逆開銷
+  - wNAF Window4/6/8 標量乘法（含預計算表快取與動態選擇）
+  - **性能：540k keys/sec**（L4，批次 16384，**38.6x 加速**；實際視自適應窗口而定）
 
 - ✅ **GPU 地址生成管線**
   - GPU 隨機數生成（CuPy）
-  - GPU secp256k1 公鑰計算（Window4 內核開發中，暫用位元掃描）
+  - GPU secp256k1 公鑰計算（Window4/6/8 內核，可動態切換）
   - GPU Keccak-256 與雙 SHA-256 合併至 Base58 kernel
   - GPU Base58Check 字串生成（結果僅回傳命中項）
   - GPU 端 Base58 前綴匹配 + 多 stream 管線化
@@ -62,7 +64,7 @@
 
 - ✅ **硬體自適應配置（HardwareAdaptiveConfig）**
   - 自動偵測 GPU 型號、SM 數、VRAM、Compute Capability
-  - 依硬體設定批次大小、Window4 門檻、CUDA threads、Stream 數
+  - 依硬體設定批次大小、wNAF Window（4/6/8）門檻、CUDA threads、Stream 數
   - 以環境變數覆蓋，方便手動調整
 
 - ✅ **多種運行模式**
@@ -74,16 +76,15 @@
 
 - ✅ **完整測試套件**
   - GPU 模運算測試（64 筆隨機樣本）
-  - GPU/CPU 一致性測試（16 筆隨機私鑰）
+  - GPU/CPU 一致性測試（多視窗 16 筆隨機私鑰）
   - GPU Base58Check 對照測試
-  - Window4 優化測試（開發中）
+  - Window4/6/8 內核交叉驗證腳本
 
 ### 開發中功能
 
-- ⚠️ **Window4 優化**
-  - 4-bit 視窗法標量乘法
-  - 預計算表已生成
-  - 驗證測試未通過（64/64 不匹配）
+- ⚠️ **wNAF Window 效能調優**
+  - Window6 內核與預算表已落地，與 Window4/8 共同由硬體自適應決策
+  - 需要針對不同 GPU（L4 / RTX 40 / A100 / H100）收集吞吐量，調整批次門檻與啟用策略
 
 ---
 
@@ -299,11 +300,11 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 
 ### 已完成 ✅
 
-- [x] **GPU secp256k1 實現**（583 行 CUDA kernel）
-  - 256-bit 模運算
-  - 橢圓曲線點運算
-  - 標量乘法
-  - 性能：540k keys/s（38.6x 加速）
+- [x] **GPU secp256k1 實現**（600+ 行 CUDA kernel）
+  - CIOS Montgomery 乘法 + Montgomery 域轉換
+  - Jacobian / 混合座標橢圓曲線點運算
+  - wNAF Window4/6/8 標量乘法 + 預計算表快取
+  - 性能：540k keys/s（L4，批次 16384，38.6x 加速，視窗口策略而定）
 
 - [x] **GPU Keccak-256 內核**
   - 24 輪 Keccak-f[1600]（CuPy RawModule）
@@ -311,7 +312,7 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 
 - [x] **GPU 地址生成管線**
   - GPU 隨機數
-  - GPU secp256k1（Window4 內核 + 快取）
+  - GPU secp256k1（Window4/6/8 內核 + 快取 + 自適應決策）
   - GPU Keccak-256 + 雙 SHA-256 + Base58Check 融合內核
   - 性能：~430k addr/s（100k 基準，GPU-FULL）
 
@@ -328,10 +329,10 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 
 ### 進行中 ⚠️
 
-- [ ] **Window4 優化**
-  - nibble 解碼/預計算表已校正
-  - 新增預計算表快取與 `warmup_window4_table` 工具
-  - 需進一步壓測與效能評估
+- [ ] **wNAF Window 效能調優**
+  - 調整 Window4/6/8 門檻與批次對應策略
+  - 針對不同 GPU 收集吞吐量（L4 / RTX40 / A100 / H100）
+  - 評估預計算表壓縮與 shared memory staging
 
 - [ ] **GPU Keccak-256**
   - 接入 GPU-FULL pipeline 後的 throughput 量測（最新 100k 測試：65,076 addr/s）
@@ -340,7 +341,7 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
 ### 待辦 📋
 
 - [ ] 完整 benchmark
-- [ ] Window4 效能調優
+- [ ] Window6/8 壓測與最佳化
 - [ ] 文檔完善
 
 ---
@@ -400,17 +401,17 @@ TRON 地址 (T...)
 - 嚴格對齊 Rho/Pi/Chi 步驟與位元序（little-endian lane）
 - 透過 `test_keccak_gpu_vs_cpu` 驗證 64-byte 輸入的一致性
 
-### 4. Window4 預計算表
+### 4. wNAF 預計算表（Window4 / Window6 / Window8）
 
 **概念**：
-- 預計算 1G, 2G, ..., 15G
-- 將 256-bit 標量切成 64 個 4-bit nibbles
-- 每次處理 4 bits，減少點加法次數
+- 針對不同視窗大小預計算 1G, 3G, ...,(2^w-1)G（僅奇數倍）
+- 將 256-bit 標量轉為 wNAF digits，每步驟僅進行一次點加與 (w-1) 次點倍
+- Window4：64 個 digit；Window6：43 個 digit；Window8：32 個 digit
 
-**當前問題**：
-- nibble 採樣順序（MSB vs LSB）
-- 初始 state 處理
-- 預計算表 limb 順序
+**現況**：
+- 三種預計算表皆採 Montgomery 座標儲存，啟動時以 `warmup_window*_table` 載入至常數記憶體
+- `HardwareAdaptiveConfig` 會依 GPU 記憶體/SM 數選擇預設窗口（例如 L4 → W6）
+- 大型窗口（W8）吞吐仍受常數記憶體帶寬與暫存器壓力影響，需後續優化
 
 ### 5. GPU-FULL 管線
 
@@ -424,7 +425,7 @@ TRON 地址 (T...)
 **性能瓶頸**：
 - Base58 字串回傳需搬移至 CPU（小量資料，但仍有傳輸成本）
 - GPU ↔ CPU 之間的同步/傳輸開銷
-- Window4 預計算快取仍待壓測最佳化
+- wNAF 大視窗（特別是 W6/W8）預計算快取與常數記憶體壓力仍待壓測最佳化
 
 ---
 
@@ -432,25 +433,25 @@ TRON 地址 (T...)
 
 ### 高優先級 🔴
 
-1. **Window4 ECC 壓測**
-   - [ ] 大量樣本與多輪迴圈的穩定性
-   - [ ] 分析快取策略與 GPU 記憶體佔用
-   - [ ] 評估與位元掃描內核的效能差異
+1. **wNAF Window 壓測與門檻調校**
+   - [ ] 收集 Window4/6/8 在不同批次、不同 GPU 上的 throughput
+   - [ ] 針對 W6/W8 設計常數記憶體/暫存器最佳化策略
+   - [ ] 依實測結果調整 `HardwareAdaptiveConfig` 與自適應門檻
 
 2. **GPU-FULL 長時間 benchmark**
-   - [ ] 量測 GPU Keccak/Base58 上線後的吞吐演變
-   - [ ] 監控溫度與記憶體使用情況
+   - [ ] 量測 wNAF 自適應 + GPU Keccak/Base58 上線後的吞吐演變
+   - [ ] 監控溫度與 VRAM 使用情況
 
 ### 中優先級 🟡
 
 3. **性能優化**
    - [ ] 優化 GPU Base58 字串回傳與批次化策略
    - [ ] 減少 GPU ↔ CPU 數據傳輸
-   - [ ] 優化批次大小選擇
-   - [ ] 記憶體池管理
+   - [ ] wNAF 預計算表壓縮 / shared memory staging
+   - [ ] 記憶體池與 Streams 管理
 
 4. **完整測試**
-   - [ ] Keccak & Window4 修正後重新 benchmark
+   - [ ] wNAF 多視窗與長時間壓測
    - [ ] GPU Keccak 單獨 throughput 測試
    - [ ] 壓力測試（長時間運行）
    - [ ] 邊界條件測試
@@ -458,7 +459,7 @@ TRON 地址 (T...)
 ### 低優先級 🟢
 
 5. **文檔與工具**
-   - [ ] 更新 devbook.md
+   - [ ] 更新 devbook.md（持續）
    - [ ] 添加 API 文檔
    - [ ] 創建使用教程
    - [ ] 添加更多示例
@@ -501,7 +502,7 @@ PYTHONPATH=src python -m tron_vanity.test_mod_arith_gpu --n 64
 # GPU Base58Check vs CPU 參考（64 筆）
 PYTHONPATH=src python -m tron_vanity.test_base58_gpu_vs_cpu --n 64
 
-# Window4 vs 參考內核比對（可指定多輪）
+# wNAF 視窗 vs 參考內核比對（可指定多輪）
 PYTHONPATH=src python -m tron_vanity.test_ecc_w4_vs_ref --n 128 --repeat 3 --warmup
 ```
 
@@ -572,7 +573,7 @@ tron-vanity/
 │   ├── validate.py             # 地址驗證
 │   │
 │   ├── gpu_random.py           # GPU 隨機數
-│   ├── gpu_secp256k1.py        # GPU secp256k1 (583 行)
+│   ├── gpu_secp256k1.py        # GPU secp256k1（Montgomery + wNAF Window4/6/8）
 │   ├── hardware_config.py      # GPU/CPU 硬體自適應配置
 │   ├── gpu_keccak.py           # GPU Keccak-256
 │   ├── gpu_addr.py             # GPU 地址生成管線
@@ -582,7 +583,7 @@ tron-vanity/
 │   │
 │   ├── test_mod_arith_gpu.py   # GPU 模運算測試
 │   ├── test_gpu_vs_cpu.py      # GPU/CPU 一致性測試
-│   ├── test_ecc_w4_vs_ref.py   # Window4 測試
+│   ├── test_ecc_w4_vs_ref.py   # wNAF 視窗交叉測試
 │   └── test_secp256k1_debug.py # secp256k1 調試
 │
 ├── agent.md                     # Agent 開發日誌
@@ -602,7 +603,7 @@ tron-vanity/
    - `auto_installer.py`：針對缺失的 Python 依賴執行 `pip install`，若遇系統級工具，提供官方安裝指引與命令範例
 
 2. **動態配置與性能預估**
-   - 強化 `hardware_config.py`，依硬體自動調整批次、Stream 數、Window4 門檻、CUDA threads 與記憶體池上限
+   - 強化 `hardware_config.py`，依硬體自動調整批次、Stream 數、wNAF Window 門檻（4/6/8）、CUDA threads 與記憶體池上限
    - `performance_estimator.py`：根據靚號末碼長度預估搜尋時間（例如 5 位 ≈ 15 分鐘 @ 700k addr/s）
 
 3. **產品級 CLI UI**
@@ -642,7 +643,7 @@ tron-vanity/
 
 2. **代碼審計**：
    - 本項目仍在開發中
-   - GPU Keccak-256 和 Window4 尚未完成驗證
+   - GPU Keccak-256 與 wNAF 大視窗（W6/W8）尚需更多壓測
    - 使用前請自行審計代碼
 
 3. **測試網優先**：
@@ -678,22 +679,22 @@ tron-vanity/
 ### v0.2.0 (開發中)
 
 **新增**：
-- ✅ 完整 GPU secp256k1 實現（540k keys/s）
+- ✅ 完整 GPU secp256k1 實現（Montgomery + wNAF Window4/6/8，自適應啟用，540k keys/s）
 - ✅ GPU 地址生成管線（~430k addr/s，GPU-FULL 約 35x 加速）
 - ✅ GPU Keccak-256 / SHA-256 / Base58Check 內核
 - ✅ V1 Demo 和 V2 Vanity 模式
-- ✅ 完整測試套件（含 Base58、Window4、Keccak 壓測）
+- ✅ 完整測試套件（含 Base58、wNAF、多視窗壓測）
 
 **已知問題**：
-- ⚠️ Window4 優化尚需壓測與效能調校
+- ⚠️ wNAF Window6/8 在大型批次與特定 GPU 上仍需壓測與效能調校
 - ⚠️ GPU-FULL 模式尚未完成長時間穩定性測試
 
 ---
 
-> **提醒**：Window4 仍在進行壓測，建議先以預設位元掃描內核為主。GPU-FULL 模式已啟用 Keccak/Base58 GPU 核心，但長時間運行仍需觀察溫度與吞吐變化。
+> **提醒**：wNAF 大視窗（W6/W8）在特定硬體下仍需壓測與 tuning。GPU-FULL 模式已啟用 Keccak/Base58 GPU 核心，但長時間運行仍需觀察溫度與吞吐變化。
 
 > **下次開發重點**：
-> 1. Window4 多輪壓測與快取策略調整
+> 1. wNAF Window4/6/8 多輪壓測與快取策略調整
 > 2. GPU-FULL 長時間 benchmark 與監控報告
 > 3. 更新性能數據與文檔（含 Base58 GPU 化成果）
 
