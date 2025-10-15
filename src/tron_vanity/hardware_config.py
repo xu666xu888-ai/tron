@@ -44,14 +44,20 @@ class HardwareAdaptiveConfig:
     estimated_addr_per_sec: int
     cupy_available: bool
     notes: Tuple[str, ...] = ()
+    gpu_count: int = 0
+    device_ids: Tuple[int, ...] = ()
+    device_names: Tuple[str, ...] = ()
+    total_vram_gb_all: float = 0.0
+    aggregate_batch_hint: Tuple[int, ...] = ()
 
     def summary(self) -> str:
         """提供讀取友善的摘要字串。"""
 
         if self.backend == "GPU" and self.compute_capability:
             major, minor = self.compute_capability
+            gpu_suffix = f" x{self.gpu_count}" if self.gpu_count > 1 else ""
             return (
-                f"[GPU] {self.profile} ({self.name}, SM={self.sm_count}, "
+                f"[GPU] {self.profile} ({self.name}{gpu_suffix}, SM={self.sm_count}, "
                 f"CC={major}.{minor}, VRAM={self.total_mem_gb:.1f} GiB)"
             )
         return (
@@ -76,6 +82,8 @@ def _profile_from_props(name: str, sm_count: int, major: int, total_mem_gb: floa
         return "H100"
     if "A100" in upper or (major == 8 and sm_count >= 108 and total_mem_gb >= 40):
         return "A100"
+    if "L40S" in upper or "L40" in upper:
+        return "L40S"
     if "4090" in upper or ("RTX" in upper and "4090" in upper):
         return "RTX4090"
     if "L4" in upper:
@@ -142,6 +150,20 @@ def _profile_template(profile: str, name: str, sm_count: int, total_mem_gb: floa
             max_pending_multiplier=4,
             memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.30),
             estimated_addr_per_sec=1_200_000,
+        )
+    if profile == "L40S":
+        return replace(
+            base,
+            default_batches=(131072, 262144, 393216, 524288, 786432, 1048576),
+            default_streams=12,
+            wnaf_threshold=393216,
+            secp_threads=512,
+            keccak_threads=512,
+            sha_threads=512,
+            base58_threads=512,
+            max_pending_multiplier=5,
+            memory_pool_limit_bytes=int(total_mem_gb * (1024**3) * 0.30),
+            estimated_addr_per_sec=1_600_000,
         )
     if profile in {"RTX4090", "Ada-Large"}:
         return replace(
@@ -260,21 +282,82 @@ def _build_gpu_config() -> HardwareAdaptiveConfig:
         raise RuntimeError("CuPy 尚未安裝，無法建立 GPU 配置")
 
     try:
-        device = cp.cuda.Device()
-        props = cp.cuda.runtime.getDeviceProperties(device.id)
+        device_count = cp.cuda.runtime.getDeviceCount()
+        if device_count <= 0:
+            raise RuntimeError("沒有可用的 CUDA 裝置")
+        device_infos = []
+        best_idx = 0
+        best_score = -1
+        for dev_id in range(device_count):
+            props = cp.cuda.runtime.getDeviceProperties(dev_id)
+            name = props["name"].decode()
+            sm_count = int(props["multiProcessorCount"])
+            total_mem = int(props["totalGlobalMem"])
+            total_mem_gb = total_mem / (1024**3)
+            major = int(props["major"])
+            minor = int(props["minor"])
+            clock = int(props.get("clockRate", 0))
+            score = sm_count * max(clock, 1)
+            if score > best_score:
+                best_idx = dev_id
+                best_score = score
+            device_infos.append(
+                {
+                    "id": dev_id,
+                    "name": name,
+                    "sm_count": sm_count,
+                    "total_mem_gb": total_mem_gb,
+                    "major": major,
+                    "minor": minor,
+                }
+            )
+        primary = device_infos[best_idx]
+        name = primary["name"]
+        sm_count = primary["sm_count"]
+        total_mem_gb = primary["total_mem_gb"]
+        major = primary["major"]
+        minor = primary["minor"]
     except Exception as exc:  # pragma: no cover - 覆蓋驅動異常
         raise RuntimeError("無法透過 CuPy 取得 GPU 屬性") from exc
-
-    name = props["name"].decode()
-    sm_count = int(props["multiProcessorCount"])
-    total_mem = int(props["totalGlobalMem"])
-    total_mem_gb = total_mem / (1024**3)
-    major = int(props["major"])
-    minor = int(props["minor"])
 
     profile = _profile_from_props(name, sm_count, major, total_mem_gb)
     template = _profile_template(profile, name, sm_count, total_mem_gb, major, minor)
     config = _apply_cpu_context(template, cupy_ok=True)
+    total_vram_all = sum(info["total_mem_gb"] for info in device_infos)
+    aggregate_batches = tuple(_align(b * device_count) for b in config.default_batches)
+    names = tuple(info["name"] for info in device_infos)
+    device_ids = tuple(info["id"] for info in device_infos)
+
+    notes = list(config.notes)
+    if device_count > 1:
+        notes.append(
+            "Multi-GPU 模式：偵測到 {} 張卡 ({})".format(
+                device_count, ", ".join(names)
+            )
+        )
+        notes.append("default_batches 為單卡建議，aggregate_batch_hint 為多卡總量參考")
+        pending_mul = max(config.max_pending_multiplier, device_count * 2)
+        config = replace(
+            config,
+            notes=tuple(notes),
+            max_pending_multiplier=pending_mul,
+            gpu_count=device_count,
+            device_ids=device_ids,
+            device_names=names,
+            total_vram_gb_all=total_vram_all,
+            aggregate_batch_hint=aggregate_batches,
+        )
+    else:
+        config = replace(
+            config,
+            notes=tuple(notes),
+            gpu_count=1,
+            device_ids=device_ids,
+            device_names=names,
+            total_vram_gb_all=total_vram_all,
+            aggregate_batch_hint=config.default_batches,
+        )
+
     _LOGGER.info("偵測 GPU：%s", config.summary())
     return config
 

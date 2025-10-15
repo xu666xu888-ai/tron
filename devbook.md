@@ -44,7 +44,17 @@
 
 ## 0. 最新更新（2025-10-15）
 
+- **W6 GLV 佔用調優**：`gpu_secp256k1.py` 允許 `VANITY_USE_FAST_MATH` 選項並對 Window6 模組套用 `--maxrregcount=128`，Jacobian 內核寄存器降至 128、`max_threads_per_block` 提升至 512。L4 實測（Batch 16384）`Window6-GLV` 吞吐由 ~0.40 Mkeys/s 提升至 ~0.64 Mkeys/s，數據已寫入 `results/w6_glv_profile_after.json` 與 `results/w6_glv_metrics.json`。
+- **V3 內核同步升級**：`src/tron_vanity_v3/gpu_secp256k1.py` 導入與主模組相同的 JSF packing、GLV combo 表與 128-bit 乘法優化，並可透過 `scripts/profile_wnaf_windows.py --module tron_vanity_v3.gpu_secp256k1` 進行專屬測試。L4 Batch 16384 實測 `Window6-GLV` 在 `VANITY_SECP_THREADS=128` 時約 0.62 Mkeys/s，較原本 W6 (~0.61 Mkeys/s) 略有優勢。
+- **硬體自適應強化**：新增 L40S / 多 GPU 辨識、自動匯出 aggregate 批次建議與總 VRAM，`hardware_config.py` 會根據卡數自調 Stream 與 pending multiplier。
+- **組態掃描腳本**：新增 `scripts/scan_wnaf_configs.py`，可批次掃描不同 `threads` × `fast-math` 組合並輸出彙整（預設寫入 `results/w6_glv_config_sweep.json`）；同時 `scripts/benchmark_gpu_pipeline.py` 支援 `--pipeline-batches/--stream-counts` 開關，便於評估 stream 數對完整地址管線吞吐的影響。
+
 - **Montgomery + wNAF v3 核心完成**：`gpu_secp256k1.py` 重新設計為 CIOS Montgomery 乘法，全面採用 Montgomery 座標轉換與 Jacobian/混合座標；新增 wNAF Window4/6/8 內核與預運算表快取，並通過 GPU/CPU 一致性驗證。
+- **W4 GLV 優化**：λ 分裂 + JSF 雙標量梯形（9 組 G/φ(G) combo、每輪僅 1 次點加），Batch 16384 實測 W4 ≈ 568M keys/s，常數記憶體/訪問壓力顯著下降
+- **W6 GLV 實驗內核**：加入 `gpu_secp256k1_batch_window6_glv`（GLV 拆解 + wNAF6 交錯、額外 φ(G) 預算表），L4 Batch 16384 ≈ 178M keys/s，尚低於既有 W6 ≈ 560M keys/s（待後續混合座標/常數壓縮優化）
+- **wNAF Profiling 腳本**：新增 `scripts/profile_wnaf_windows.py` 可一次量測 Baseline/W4/W6/W6-GLV/W8（預設輸出 JSON），初步數據記錄於 `results/wnaf_profile.json`，W6-GLV 仍顯著落後其他窗口；輔助的 `scripts/inspect_secp_kernel_attrs.py` 可輸出各 kernel 的 registers/const memory 佔用（JSON 於 `results/secp_kernel_attrs.json`），確認 W6/W6-GLV 皆需 146/144 regs、const memory 8.6KB，相較 Baseline/W4 有更高壓力。
+- **GLV + JSF 調整**：`gpu_secp256k1_batch_window6_glv` 重新改用 JSF 雙標量策略，共用 W4 的 9 組預算表；性能已從 0.18M keys/s 提升至 ~0.40M keys/s（batch 16384，L4），但仍低於 baseline。
+- **Digit 分布分析工具**：新增 `scripts/analyze_glv_jsf.py` + `debug_glv_jsf_digits`（GPU 內部調試 API），4096 樣本統計顯示平均 JSF 長度約 72、兩標量同時非零比例約 9.7%，主要組合集中在 ±1。
 - **Window6 內核與自適應調度**：`gpu_addr.py` 內建硬體自適應策略，依 GPU SM/記憶體自動選擇 Window4/6/8，並提供 `warmup_window*_table` 預熱 API。
 - **文檔與測試更新**：README、開發書同步記錄 v3 重大更新；測試腳本覆蓋多視窗交叉驗證；增加 wNAF 門檻與批次調整 TODO。
 - **保留舊里程碑（2025-10-14）**：v3 目錄建立、Base58 尾碼支援、HardwareAdaptiveConfig 與 CLI 產品化計畫的基礎仍沿用。
@@ -167,11 +177,10 @@ export VANITY_EXPERIMENTAL_GPU_SECP=1
    - Jacobian 座標系統（避免模逆運算）
    - 點加法（point_add）
    - 點倍乘（point_double）
-   - Jacobian → Affine 轉換
+   - Jacobian → Affine 轉換（Montgomery trick 批量逆元）
 
 3. **標量乘法**
-   - Double-and-add 算法
-   - 從 MSB 到 LSB 掃描
+   - Double-and-add 與 wNAF 視窗（Window4/6/8）
    - 每個 GPU 線程處理一個私鑰
 
 **性能數據**（NVIDIA L4）：

@@ -48,7 +48,9 @@
   - 256-bit 大數模運算 + Montgomery 域轉換（針對 secp256k1 素數優化）
   - Jacobian / 混合座標點運算，減少模逆開銷
   - wNAF Window4/6/8 標量乘法（含預計算表快取與動態選擇）
+  - **GLV + JSF 雙標量梯形**：9 組常數記憶體組合、每輪僅 1 次點加，Batch 16384 實測 W4 ≈ 568M keys/s
   - **性能：540k keys/sec**（L4，批次 16384，**38.6x 加速**；實際視自適應窗口而定）
+  - **W6 GLV 實驗 API**：新增 `gpu_secp256k1_batch_window6_glv`（GLV 拆解 + wNAF6 交錯）；Batch 16384 on L4 ≈ 178M keys/s（暫未超過既有 W6）
 
 - ✅ **GPU 地址生成管線**
   - GPU 隨機數生成（CuPy）
@@ -326,6 +328,9 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
   - GPU/CPU 一致性測試 ✅
   - GPU Keccak vs CPU ✅
   - 環境檢查腳本 ✅
+- [x] **硬體自適應擴充**
+  - 新增 L40S / 多 GPU 辨識與預設批次、Stream、wNAF 門檻調整
+  - 設定檔會同步列出偵測到的 GPU 名稱、總 VRAM、Aggregate 批次建議
 
 ### 進行中 ⚠️
 
@@ -333,6 +338,7 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
   - 調整 Window4/6/8 門檻與批次對應策略
   - 針對不同 GPU 收集吞吐量（L4 / RTX40 / A100 / H100）
   - 評估預計算表壓縮與 shared memory staging
+- [ ] **GLV + JSF 實驗**：`gpu_secp256k1_batch_window6_glv` 已可測試（L4 Batch16384 ≈ 178M keys/s，尚未優於既有 W6）
 
 - [ ] **GPU Keccak-256**
   - 接入 GPU-FULL pipeline 後的 throughput 量測（最新 100k 測試：65,076 addr/s）
@@ -387,6 +393,8 @@ TRON 地址 (T...)
 - **Jacobian 座標**：避免昂貴的模逆運算
 - **特殊素數快速約簡**：利用 p 的特殊形式
 - **批量並行處理**：每個 GPU 線程處理一個私鑰
+- **Montgomery trick 批量逆元**：Jacobian → Affine 轉換每個批次僅需一次模逆
+- **GLV（Window4）精簡表**：使用 λ 分裂 + JSF 組合點（9 組 G/φ(G) 組合）減少常數記憶體負擔
 
 ### 3. Keccak-256 注意事項
 
@@ -563,7 +571,11 @@ tron-vanity/
 │
 ├── scripts/                     # 工具腳本
 │   ├── check_env.py            # 環境檢查
-│   ├── benchmark.py            # 性能測試
+│   ├── benchmark.py            # GPU 管線基準
+│   ├── profile_wnaf_windows.py # wNAF/GLV kernel 吞吐量測，支援 --module 指定 v3
+│   ├── scan_wnaf_configs.py    # 掃描 threads × fast-math 組合（多硬體比較）
+│   ├── inspect_secp_kernel_attrs.py # CuPy kernel 屬性（register/const/shared）
+│   ├── analyze_glv_jsf.py      # GLV+JSF digit 分布統計
 │   └── test_gpu_v2.py          # GPU 測試
 │
 ├── src/tron_vanity/            # 核心代碼
@@ -684,6 +696,7 @@ tron-vanity/
 - ✅ GPU Keccak-256 / SHA-256 / Base58Check 內核
 - ✅ V1 Demo 和 V2 Vanity 模式
 - ✅ 完整測試套件（含 Base58、wNAF、多視窗壓測）
+- ✅ Window4 重新導入 GLV + JSF 雙標量 ladder（常數表縮至 9 組，Batch 16384 實測 ~568M keys/s）
 
 **已知問題**：
 - ⚠️ wNAF Window6/8 在大型批次與特定 GPU 上仍需壓測與效能調校
