@@ -296,6 +296,17 @@ PYTHONPATH=src python -m tron_vanity.v2_vanity \
   --timeout 30
 ```
 
+### 4. 實驗版 CLI（建議於開發期間使用）
+
+實驗版 CLI 整合了自動依賴檢測、性能預估與互動式搜尋流程，後續所有優化預設都在此包內完成：
+
+```bash
+# 啟動實驗版 CLI（保持尾碼大小寫）
+python3 src/tron_vanity_experimental --suffix 88888
+```
+
+> 提醒：若輸入尾碼包含 Base58 不支援字元（例如 0、O、I、l），CLI 會提示錯誤並請你重新輸入；大小寫不再自動轉換，完全依照使用者輸入。
+
 ---
 
 ## ✅ 開發進度
@@ -572,36 +583,30 @@ tron-vanity/
 ├── scripts/                     # 工具腳本
 │   ├── check_env.py            # 環境檢查
 │   ├── benchmark.py            # GPU 管線基準
-│   ├── profile_wnaf_windows.py # wNAF/GLV kernel 吞吐量測，支援 --module 指定 v3
+│   ├── profile_wnaf_windows.py # wNAF/GLV kernel 吞吐量測，可指定 --module tron_vanity_experimental.gpu_secp256k1
 │   ├── scan_wnaf_configs.py    # 掃描 threads × fast-math 組合（多硬體比較）
 │   ├── inspect_secp_kernel_attrs.py # CuPy kernel 屬性（register/const/shared）
 │   ├── analyze_glv_jsf.py      # GLV+JSF digit 分布統計
 │   └── test_gpu_v2.py          # GPU 測試
 │
-├── src/tron_vanity/            # 核心代碼
-│   ├── __init__.py             # 包初始化
-│   │
-│   ├── addr.py                 # CPU 地址生成
-│   ├── validate.py             # 地址驗證
-│   │
-│   ├── gpu_random.py           # GPU 隨機數
-│   ├── gpu_secp256k1.py        # GPU secp256k1（Montgomery + wNAF Window4/6/8）
-│   ├── hardware_config.py      # GPU/CPU 硬體自適應配置
-│   ├── gpu_keccak.py           # GPU Keccak-256
-│   ├── gpu_addr.py             # GPU 地址生成管線
-│   │
-│   ├── v1_demo.py              # V1 演示模式
-│   ├── v2_vanity.py            # V2 靚號搜索
-│   │
-│   ├── test_mod_arith_gpu.py   # GPU 模運算測試
-│   ├── test_gpu_vs_cpu.py      # GPU/CPU 一致性測試
-│   ├── test_ecc_w4_vs_ref.py   # wNAF 視窗交叉測試
-│   └── test_secp256k1_debug.py # secp256k1 調試
-│
+├── src/
+│   ├── tron_vanity/            # 穩定版核心（正式釋出）
+│   │   ├── __init__.py
+│   │   ├── v1_demo.py
+│   │   ├── v2_vanity.py
+│   │   └── ...                 # GPU 內核、測試等穩定元件
+│   └── tron_vanity_experimental/ # 實驗版開發主線
+│       ├── __main__.py         # 允許 `python3 src/tron_vanity_experimental`
+│       ├── cli.py              # 新 CLI 主入口
+│       ├── search_engine.py    # 靚號搜尋流程
+│       ├── gpu_addr.py         # GPU 完整管線
+│       └── ...                 # 其他實驗中模組
 ├── agent.md                     # Agent 開發日誌
 ├── claude.md                    # Claude 對話記錄
 └── devbook.md                   # 開發手冊
 ```
+
+> **版本策略**：所有正式釋出的穩定功能維持於 `src/tron_vanity`；實驗性優化、CLI 與 GPU 管線調整皆在 `src/tron_vanity_experimental` 進行，待驗證穩定後再同步回穩定版。開發測試時請優先使用 `python3 src/tron_vanity_experimental` 啟動。
 
 ---
 

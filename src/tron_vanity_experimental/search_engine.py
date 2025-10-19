@@ -12,6 +12,17 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from .addr import privkey_to_tron_address
 from .hardware_config import HardwareAdaptiveConfig
 
+_BASE58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+
+def _validate_suffix_charset(value: str) -> None:
+    """確認尾碼僅包含 Base58 字元，否則拋出資訊化錯誤。"""
+
+    invalid = sorted({ch for ch in value if ch not in _BASE58_ALPHABET})
+    if invalid:
+        detail = ", ".join(invalid)
+        raise ValueError(f"suffix 包含非 Base58 字元：{detail}")
+
 ProgressCallback = Callable[[int, int, int, float, Optional[Dict[str, float]]], None]
 
 
@@ -56,12 +67,13 @@ class VanitySearchEngine:
         if not suffix:
             raise ValueError("suffix 不可為空白字串")
 
-        suffix_upper = suffix.upper()
         start_time = time.time()
+
+        _validate_suffix_charset(suffix)
 
         if self._config.backend == "GPU" and self._config.cupy_available:
             hits, attempts, reason = self._search_gpu(
-                suffix_upper,
+                suffix,
                 start_time=start_time,
                 timeout=timeout,
                 max_attempts=max_attempts,
@@ -69,7 +81,7 @@ class VanitySearchEngine:
             )
         else:
             hits, attempts, reason = self._search_cpu(
-                suffix_upper,
+                suffix,
                 start_time=start_time,
                 timeout=timeout,
                 max_attempts=max_attempts,

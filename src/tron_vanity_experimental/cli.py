@@ -23,7 +23,7 @@ if __package__ in (None, "", "__main__"):
     repo_src = Path(__file__).resolve().parents[1]
     if str(repo_src) not in sys.path:
         sys.path.insert(0, str(repo_src))
-    __package__ = "tron_vanity_v3"
+    __package__ = "tron_vanity_experimental"
 
 from . import __version__
 DEFAULT_CONFIG_LOCATIONS = (
@@ -35,6 +35,7 @@ SESSION_POLL_INTERVAL = 0.5
 _LOG_LEVEL_ENV = "VANITY_LOG_LEVEL"
 _LOG_KEEP_ENV = "VANITY_LOG_KEEP_BYTES"
 _DEFAULT_LOG_KEEP = 512_000  # 512 KB
+_BASE58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 def _configure_logging() -> None:
@@ -425,6 +426,10 @@ def _prompt_suffix(
             return ""
         if not interactive and not skip_prompt:
             console.print(f"[yellow]非互動環境偵測，使用預設尾碼：{default}[/yellow]")
+        invalid_default = sorted({ch for ch in default if ch not in _BASE58_ALPHABET})
+        if invalid_default:
+            detail = ", ".join(invalid_default)
+            raise SystemExit(f"尾碼包含 Base58 不支援字元：{detail}")
         return default
 
     while True:
@@ -437,8 +442,25 @@ def _prompt_suffix(
             prompt = "[bold cyan]請輸入欲搜尋的末幾碼 (例如 88888)：[/] "
         value = console.input(prompt).strip()
         if value:
+            invalid_chars = sorted({ch for ch in value if ch not in _BASE58_ALPHABET})
+            if invalid_chars:
+                detail = ", ".join(invalid_chars)
+                console.print(
+                    "[red]尾碼包含 Base58 不支援字元：[/red]"
+                    f"[white]{detail}[/white][red]，請重新輸入。[/red]"
+                )
+                continue
             return value
         if default:
+            invalid_default = sorted({ch for ch in default if ch not in _BASE58_ALPHABET})
+            if invalid_default:
+                detail = ", ".join(invalid_default)
+                console.print(
+                    "[red]預設尾碼包含 Base58 不支援字元：[/red]"
+                    f"[white]{detail}[/white][red]，請重新輸入。[/red]"
+                )
+                default = ""
+                continue
             console.print(f"[green]已套用預設尾碼：{default}[/green]")
             return default
         console.print("[red]尾碼不可為空白，請重新輸入。[/red]")
@@ -611,7 +633,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 def _start_background_worker(session_path: Path) -> int:
     """啟動背景工作進程，並將輸出寫入共用日誌。"""
 
-    cmd = [sys.executable, "-m", "tron_vanity_v3.cli", "--worker", "--session-file", str(session_path)]
+    cmd = [sys.executable, "-m", "tron_vanity_experimental.cli", "--worker", "--session-file", str(session_path)]
     env = os.environ.copy()
     src_root = Path(__file__).resolve().parents[1]  # 指向 .../src
     env_py = env.get("PYTHONPATH")

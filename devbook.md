@@ -45,7 +45,7 @@
 ## 0. 最新更新（2025-10-15）
 
 - **W6 GLV 佔用調優**：`gpu_secp256k1.py` 允許 `VANITY_USE_FAST_MATH` 選項並對 Window6 模組套用 `--maxrregcount=128`，Jacobian 內核寄存器降至 128、`max_threads_per_block` 提升至 512。L4 實測（Batch 16384）`Window6-GLV` 吞吐由 ~0.40 Mkeys/s 提升至 ~0.64 Mkeys/s，數據已寫入 `results/w6_glv_profile_after.json` 與 `results/w6_glv_metrics.json`。
-- **V3 內核同步升級**：`src/tron_vanity_v3/gpu_secp256k1.py` 導入與主模組相同的 JSF packing、GLV combo 表與 128-bit 乘法優化，並可透過 `scripts/profile_wnaf_windows.py --module tron_vanity_v3.gpu_secp256k1` 進行專屬測試。L4 Batch 16384 實測 `Window6-GLV` 在 `VANITY_SECP_THREADS=128` 時約 0.62 Mkeys/s，較原本 W6 (~0.61 Mkeys/s) 略有優勢。
+- **實驗版內核同步升級**：`src/tron_vanity_experimental/gpu_secp256k1.py` 導入與主模組相同的 JSF packing、GLV combo 表與 128-bit 乘法優化，並可透過 `scripts/profile_wnaf_windows.py --module tron_vanity_experimental.gpu_secp256k1` 進行專屬測試。L4 Batch 16384 實測 `Window6-GLV` 在 `VANITY_SECP_THREADS=128` 時約 0.62 Mkeys/s，較原本 W6 (~0.61 Mkeys/s) 略有優勢。
 - **硬體自適應強化**：新增 L40S / 多 GPU 辨識、自動匯出 aggregate 批次建議與總 VRAM，`hardware_config.py` 會根據卡數自調 Stream 與 pending multiplier。
 - **組態掃描腳本**：新增 `scripts/scan_wnaf_configs.py`，可批次掃描不同 `threads` × `fast-math` 組合並輸出彙整（預設寫入 `results/w6_glv_config_sweep.json`）；同時 `scripts/benchmark_gpu_pipeline.py` 支援 `--pipeline-batches/--stream-counts` 開關，便於評估 stream 數對完整地址管線吞吐的影響。
 
@@ -91,8 +91,15 @@
    │   ├─ test_gpu_vs_cpu.py        # GPU/CPU 一致性測試
    │   ├─ test_ecc_w4_vs_ref.py     # wNAF 視窗交叉測試
    │   └─ test_secp256k1_debug.py   # secp256k1 調試
-   └─ tron_vanity_v3/              # 新增：C++/CUDA 擴充開發沙盒（暫時與穩定版同內容）
+   └─ tron_vanity_experimental/    # 實驗版 CLI / GPU 管線開發主線
+       ├─ __main__.py              # 允許 `python3 src/tron_vanity_experimental`
+       ├─ cli.py                   # 產品級 CLI 入口
+       ├─ search_engine.py         # 靚號搜尋流程控制
+       ├─ gpu_addr.py              # GPU 管線與 Base58 篩選
+       └─ ...                      # 其他實驗模組（穩定後再同步至 tron_vanity）
 ```
+
+> **版本策略提醒**：穩定功能維持於 `src/tron_vanity`；所有實驗性修訂請在 `src/tron_vanity_experimental` 完成並驗證後，再回滾同步到穩定版。開發測試請直接透過 `python3 src/tron_vanity_experimental` 啟動。
 
 ---
 
