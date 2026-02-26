@@ -603,6 +603,8 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     )
     parser.add_argument("--attach", action="store_true", help="連接背景搜尋任務的即時狀態")
     parser.add_argument("--stop", action="store_true", help="要求目前的背景搜尋任務停止")
+    parser.add_argument("--turbo", action="store_true", help="使用 130+ Mkeys/s 融合 GPU 引擎（推薦）")
+    parser.add_argument("--gpu-ids", type=str, help="指定 GPU 裝置 ID（逗號分隔，如 0,1,2）")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--session-file", type=str, help=argparse.SUPPRESS)
     return parser.parse_args([] if argv is None else list(argv))
@@ -1090,6 +1092,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_path = _save_cli_config(config, args.save_config or None, args)
         console.print(f"[green]已將設定寫入：{save_path}[/green]")
         config_path = save_path
+
+    # ---- Turbo mode: bypass legacy pipeline, use 130+ Mkeys/s fused kernel ----
+    if getattr(args, 'turbo', False):
+        gpu_ids = None
+        if getattr(args, 'gpu_ids', None):
+            gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(',')]
+        from .turbo_search import cli_turbo_search
+        return cli_turbo_search(
+            suffix=suffix,
+            timeout=args.timeout,
+            max_attempts=args.max_attempts,
+            gpu_ids=gpu_ids,
+        )
 
     console.rule("開始搜尋")
     skip_confirm = args.yes and not meta.get("yes_from_config", False)

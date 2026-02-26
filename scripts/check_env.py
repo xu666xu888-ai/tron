@@ -20,7 +20,12 @@ PKGS = [
     ("base58", "__version__"),
     ("tronpy", "__version__"),
     ("requests", "__version__"),
-    ("sha3", None),
+    ("sha3", None),  # pycryptodome 提供 Crypto.Hash.keccak，此處檢測舊版相容
+]
+
+# 額外檢查 pycryptodome
+EXTRA_PKGS = [
+    ("Crypto.Hash.keccak", None),
 ]
 
 

@@ -34,10 +34,15 @@ except Exception as e:  # pragma: no cover
     raise ImportError("需要安裝 CuPy 才能使用 gpu_addr 模組：pip install cupy-cuda11x/12x") from e
 
 import base58
-import sha3
+from Crypto.Hash import keccak as _keccak_mod  # pycryptodome Keccak-256
 import numpy as np
 
 from .hardware_config import HARDWARE_CONFIG, HardwareAdaptiveConfig
+
+
+def _ascii_safe(code: str) -> str:
+    """Strip non-ASCII chars from CUDA source to avoid CuPy NVRTC UnicodeEncodeError."""
+    return code.encode('ascii', errors='ignore').decode('ascii')
 
 _HARDWARE_CFG = HARDWARE_CONFIG
 
@@ -689,7 +694,7 @@ extern "C" __global__ void sha256_oneblock(
 }
 """
 
-_sha256_mod = cp.RawModule(code=_SHA256_KERNEL, options=("-std=c++11",))
+_sha256_mod = cp.RawModule(code=_ascii_safe(_SHA256_KERNEL), options=("-std=c++11",))
 _sha256_kernel = _sha256_mod.get_function("sha256_oneblock")
 
 
@@ -755,7 +760,7 @@ extern "C" __global__ void base58_encode_25(
 }
 """
 
-_base58_mod = cp.RawModule(code=_BASE58_KERNEL, options=("-std=c++11",))
+_base58_mod = cp.RawModule(code=_ascii_safe(_BASE58_KERNEL), options=("-std=c++11",))
 _base58_kernel = _base58_mod.get_function("base58_encode_25")
 
 _BASE58_FUSED_KERNEL = r"""
@@ -909,7 +914,7 @@ extern "C" __global__ void tron21_to_base58(
 }
 """
 
-_base58_fused_mod = cp.RawModule(code=_BASE58_FUSED_KERNEL, options=("-std=c++11",))
+_base58_fused_mod = cp.RawModule(code=_ascii_safe(_BASE58_FUSED_KERNEL), options=("-std=c++11",))
 _base58_fused_kernel = _base58_fused_mod.get_function("tron21_to_base58")
 
 _PREFIX_FILTER_KERNEL = r"""
@@ -943,7 +948,7 @@ extern "C" __global__ void prefix_filter(
 }
 """
 
-_prefix_filter_mod = cp.RawModule(code=_PREFIX_FILTER_KERNEL, options=("-std=c++11",))
+_prefix_filter_mod = cp.RawModule(code=_ascii_safe(_PREFIX_FILTER_KERNEL), options=("-std=c++11",))
 _prefix_filter_kernel = _prefix_filter_mod.get_function("prefix_filter")
 
 _SUFFIX_FILTER_KERNEL = r"""
@@ -974,7 +979,7 @@ extern "C" __global__ void suffix_mod_filter(
 }
 """
 
-_suffix_filter_mod = cp.RawModule(code=_SUFFIX_FILTER_KERNEL, options=("-std=c++11",))
+_suffix_filter_mod = cp.RawModule(code=_ascii_safe(_SUFFIX_FILTER_KERNEL), options=("-std=c++11",))
 _suffix_filter_kernel = _suffix_filter_mod.get_function("suffix_mod_filter")
 
 
@@ -1029,9 +1034,7 @@ def _sha256d(data: bytes) -> bytes:
 
 def _keccak_256(data: bytes) -> bytes:
     """計算 Keccak-256（CPU 後備）。"""
-    k = sha3.keccak_256()
-    k.update(data)
-    return k.digest()
+    return _keccak_mod.new(data=data, digest_bits=256).digest()
 
 
 def gpu_secp256k1_batch(

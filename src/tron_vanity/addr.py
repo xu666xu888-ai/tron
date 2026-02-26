@@ -16,7 +16,7 @@ from typing import Tuple
 
 import base58  # Base58Check 編碼
 import coincurve  # 以 libsecp256k1 加速的 Python 綁定
-import sha3  # Keccak-256
+from Crypto.Hash import keccak as _keccak_mod  # pycryptodome Keccak-256（取代 pysha3）
 
 
 # ------ 基礎工具函式 ------
@@ -25,9 +25,7 @@ def keccak_256(data: bytes) -> bytes:
     """計算 Keccak-256 雜湊。
     參考以太坊/波場地址導出流程，對未壓縮公鑰去掉開頭 0x04 後的 64 bytes 做 keccak。
     """
-    k = sha3.keccak_256()
-    k.update(data)
-    return k.digest()
+    return _keccak_mod.new(data=data, digest_bits=256).digest()
 
 
 def sha256d(data: bytes) -> bytes:

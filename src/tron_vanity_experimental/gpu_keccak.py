@@ -24,6 +24,11 @@ except Exception as e:  # pragma: no cover
 
 from .hardware_config import HARDWARE_CONFIG
 
+
+def _ascii_safe(code: str) -> str:
+    """Strip non-ASCII chars from CUDA source to avoid CuPy NVRTC UnicodeEncodeError."""
+    return code.encode('ascii', errors='ignore').decode('ascii')
+
 _KECCAK_THREADS = int(os.environ.get("VANITY_KECCAK_THREADS", str(HARDWARE_CONFIG.keccak_threads)))
 
 
@@ -253,7 +258,7 @@ extern "C" __global__ void keccak256_64_addr(
 }
 """
 
-_mod = cp.RawModule(code=_KECCAK256_KERNEL, options=("-std=c++11",))
+_mod = cp.RawModule(code=_ascii_safe(_KECCAK256_KERNEL), options=("-std=c++11",))
 _ker_full = _mod.get_function("keccak256_64")
 _ker_addr = _mod.get_function("keccak256_64_addr")
 
@@ -312,14 +317,13 @@ def keccak256_xy_batch(
             _ker_full((blocks,), (threads,), (xy_gpu, out_gpu, cp.int32(stride_in), cp.int32(stride_out), cp.int32(n)))
         return out_gpu
     except Exception:
-        import numpy as np, sha3
+        import numpy as np
+        from Crypto.Hash import keccak as _keccak_mod
         xy_cpu: np.ndarray = cp.asnumpy(pubkey_xy_gpu)
         out_len = 20 if address_only else 32
         out = np.empty((xy_cpu.shape[0], out_len), dtype=np.uint8)
         for i in range(xy_cpu.shape[0]):
-            k = sha3.keccak_256()
-            k.update(bytes(xy_cpu[i]))
-            digest = k.digest()
+            digest = _keccak_mod.new(data=bytes(xy_cpu[i]), digest_bits=256).digest()
             if address_only:
                 out[i, :] = np.frombuffer(digest[-20:], dtype=np.uint8)
             else:
