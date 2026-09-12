@@ -115,7 +115,7 @@ gcloud compute instances delete-access-config tron-vanity-l4 \
 
 ```bash
 python3 -m unittest discover -s deploy/tests -v
-bash -n deploy/gcloud_deploy.sh deploy/install_app.sh deploy/install_gpu_driver.sh deploy/tron-vanity
+for script in deploy/*.sh deploy/tron-vanity; do bash -n "$script" || break; done
 ```
 
 測試以假的 gcloud / 搜尋結果驗證流程與失敗處理；不代表 GPU 效能或乾淨部署驗收。
