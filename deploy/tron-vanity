@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PYTHONPATH=/opt/tron-vanity/src
+exec /opt/tron-vanity/.venv/bin/python /opt/tron-vanity/secure_vanity_run.py "$@"

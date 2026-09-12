@@ -4,6 +4,20 @@
 
 ## 快速開始
 
+### GCP L4：從零一鍵部署
+
+在已登入 gcloud 的 Mac / Linux 終端執行（會建立付費 VM）：
+
+```bash
+bash deploy/gcloud_deploy.sh YOUR_PROJECT_ID asia-southeast1-c tron-vanity-l4
+```
+
+部署與 GPU 自檢成功後會印出 SSH 指令。登入後使用 `tron-vanity 88888 --timeout 900`，
+命中會顯示私鑰並保存權限 0600 的結果檔。完整前置條件、網路限制、重試與刪除注意事項：
+[GCP 部署及 SSH 使用流程](deploy/README.md)。此流程使用 Ubuntu 22.04 / Python 3.10。
+
+### 已有 GPU 環境
+
 ```bash
 source .venv/bin/activate
 
@@ -64,4 +78,3 @@ pip install cupy-cuda12x
 2. **不要用 `__launch_bounds__`** — 在此 workload 下強制 spill 效果更差
 3. **不要改 Montgomery multiplication** — 原始 schoolbook `t[16]` 已是 NVCC 近最佳
 4. **效能提升應從演算法層級** — 如增量掃描（1 add/key 取代 320 ops/key）
-

@@ -1,0 +1,5 @@
+# Ubuntu 22.04 / Python 3.10. Keep the general CLI dependencies in one place.
+-r ../requirements.txt
+# Pin the GPU-facing packages; the NVIDIA driver is installed separately.
+numpy==2.2.6
+cupy-cuda12x[ctk]==14.2.0

@@ -43,3 +43,7 @@ Thumbs.db
 test_output/
 benchmark_results/
 results/
+tron-results/
+tron-*.json
+.deployed-commit
+*.tar.gz
